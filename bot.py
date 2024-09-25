@@ -308,7 +308,7 @@ async def format_expense_report(data):
 
 # Генерация отчета в Excel (добавьте pandas)
 
-async def generate_excel_report(start_date: str, end_date: str, user_id: int) -> str:
+async def generate_excel_report(start_date: str, end_date: str, user_id: int) -> str | None:
     try:
         # Заменяем двоеточия на тире, чтобы избежать недопустимых символов в имени файла
         safe_start_date = start_date.replace(':', '-')
@@ -436,7 +436,7 @@ async def get_period_dates(period: str) -> tuple[str, str]:
         start_date: str = (today - timedelta(days=365)).strftime("%Y-%m-%d 00:00:00")
         end_date: str = today.strftime("%Y-%m-%d %H:%M:%S")
     else:
-        start_date = end_date = None
+        start_date = end_date = ""
     return start_date, end_date
 
 # Функция для получения всех расходов пользователя
