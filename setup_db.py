@@ -95,5 +95,9 @@ async def init_db():
             'CREATE INDEX IF NOT EXISTS idx_templates_user_day ON recurring_templates(user_id, day_of_month)')
 
 
+async def _standalone_init():
+    await init_db()
+    await DatabaseConnection.close()
+
 if __name__ == "__main__":
-    asyncio.run(init_db())
+    asyncio.run(_standalone_init())

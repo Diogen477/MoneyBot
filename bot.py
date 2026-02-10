@@ -1340,13 +1340,12 @@ scheduler.add_job(send_template_reminders, 'cron', hour=9, minute=0,
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def main():
-    await app.start()
-    scheduler.start()
-    logging.info("Бот запущен. Планировщик активен.")
-    await idle()
-    scheduler.shutdown()
-    await DatabaseConnection.close()
-    await app.stop()
+    async with app:
+        scheduler.start()
+        logging.info("Бот запущен. Планировщик активен.")
+        await idle()
+        scheduler.shutdown()
+        await DatabaseConnection.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run(main())
