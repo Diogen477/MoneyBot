@@ -1,0 +1,8 @@
+.idea/
+.env
+*.db
+*.png
+*.xlsx
+expense_bot.session
+__pycache__/
+*.pyc
