@@ -1,0 +1,6 @@
+aiosqlite
+matplotlib
+openpyxl
+pandas
+pyrogram
+python-dotenv
