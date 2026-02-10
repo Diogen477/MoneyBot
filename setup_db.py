@@ -64,19 +64,35 @@ async def init_db():
             )
         ''')
 
-        # Индексы для ускорения частых запросов
         await cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_expenses_user_date
-            ON expenses(user_id, date)
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                currency TEXT DEFAULT 'KZT',
+                last_category_id INTEGER
+            )
         ''')
+
         await cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_expenses_category
-            ON expenses(category_id)
+            CREATE TABLE IF NOT EXISTS recurring_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                category_id INTEGER NOT NULL,
+                name TEXT,
+                amount REAL NOT NULL,
+                day_of_month INTEGER NOT NULL CHECK(day_of_month BETWEEN 1 AND 28),
+                FOREIGN KEY (category_id) REFERENCES categories(id)
+            )
         ''')
-        await cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_categories_user
-            ON categories(user_id)
-        ''')
+
+        # Индексы
+        await cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date)')
+        await cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category_id)')
+        await cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_categories_user ON categories(user_id)')
+        await cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_templates_user_day ON recurring_templates(user_id, day_of_month)')
 
 
 if __name__ == "__main__":
