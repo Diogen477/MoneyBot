@@ -1,9 +1,9 @@
-import asyncio
 import json
 import logging
 import os
 import re
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 
 import aiosqlite
 import pandas as pd
@@ -16,6 +16,7 @@ from pyrogram import Client, filters, idle
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
     CallbackQuery,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -26,7 +27,8 @@ from setup_db import DatabaseConnection
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
 load_dotenv()
 
 api_id = os.getenv('API_ID')
@@ -34,9 +36,11 @@ api_hash = os.getenv('API_HASH')
 bot_token = os.getenv('BOT_TOKEN')
 
 if not all([api_id, api_hash, bot_token]):
-    raise RuntimeError("Не заданы API_ID, API_HASH или BOT_TOKEN. Проверьте .env файл.")
+    raise RuntimeError(
+        "Не заданы API_ID, API_HASH или BOT_TOKEN. Проверьте .env файл.")
 
-app = Client("expense_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
+app = Client("expense_bot", api_id=api_id,
+             api_hash=api_hash, bot_token=bot_token)
 
 ALMATY_TZ = pytz.timezone('Asia/Almaty')
 MAX_MESSAGE_LENGTH = 4000
@@ -48,25 +52,22 @@ CURRENCY_SYMBOLS = {
 
 # ─── Клавиатуры ──────────────────────────────────────────────────────────────
 
-# Клавиатура с одной кнопкой "Назад" — показывается при любом текстовом вводе
-back_keyboard = ReplyKeyboardMarkup(
-    [[KeyboardButton("Назад")]],
-    resize_keyboard=True,
-)
-
 main_keyboard = ReplyKeyboardMarkup(
     [
         [KeyboardButton("Категории"), KeyboardButton("Шаблоны")],
         [KeyboardButton("Отчет"), KeyboardButton("Отчет по категории")],
-        [KeyboardButton("Все траты"), KeyboardButton("Настройки")],
+        [KeyboardButton("Все траты")],
     ],
     resize_keyboard=True,
 )
 
 category_submenu = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("Мои категории"), KeyboardButton("Добавить категорию")],
-        [KeyboardButton("Удалить категорию"), KeyboardButton("Назад")],
+        [KeyboardButton("Мои категории"),
+         KeyboardButton("Добавить категорию")],
+        [KeyboardButton("Удалить категорию"),
+         KeyboardButton("Объединить категории")],
+        [KeyboardButton("Назад")],
     ],
     resize_keyboard=True, one_time_keyboard=True,
 )
@@ -74,16 +75,7 @@ category_submenu = ReplyKeyboardMarkup(
 template_submenu = ReplyKeyboardMarkup(
     [
         [KeyboardButton("Мои шаблоны"), KeyboardButton("Добавить шаблон")],
-        [KeyboardButton("Редактировать шаблон"), KeyboardButton("Удалить шаблон")],
-        [KeyboardButton("Назад")],
-    ],
-    resize_keyboard=True, one_time_keyboard=True,
-)
-
-settings_submenu = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("Валюта"), KeyboardButton("Справка")],
-        [KeyboardButton("Назад")],
+        [KeyboardButton("Удалить шаблон"), KeyboardButton("Назад")],
     ],
     resize_keyboard=True, one_time_keyboard=True,
 )
@@ -91,7 +83,8 @@ settings_submenu = ReplyKeyboardMarkup(
 period_keyboard = ReplyKeyboardMarkup(
     [
         [KeyboardButton("День"), KeyboardButton("Неделя")],
-        [KeyboardButton("Месяц"), KeyboardButton("Квартал"), KeyboardButton("Год")],
+        [KeyboardButton("Месяц"), KeyboardButton(
+            "Квартал"), KeyboardButton("Год")],
         [KeyboardButton("Ввести даты вручную")],
         [KeyboardButton("Назад")],
     ],
@@ -108,7 +101,8 @@ async def category_keyboard(user_id):
 
 def undo_keyboard(expense_id):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("↩ Отменить", callback_data=f"undo:{expense_id}")]
+        [InlineKeyboardButton(
+            "↩ Отменить", callback_data=f"undo:{expense_id}")]
     ])
 
 
@@ -116,6 +110,32 @@ def confirm_category_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Да", callback_data="cat_yes"),
          InlineKeyboardButton("Другая", callback_data="cat_other")]
+    ])
+
+
+def create_category_keyboard():
+    """Клавиатура для предложения создать новую категорию."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, создать", callback_data="create_cat_yes"),
+         InlineKeyboardButton("❌ Нет", callback_data="create_cat_no")]
+    ])
+
+
+def fuzzy_category_keyboard():
+    """Клавиатура для нечёткого совпадения категории."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, использовать",
+                              callback_data="fuzzy_cat_yes")],
+        [InlineKeyboardButton("➕ Нет, создать новую",
+                              callback_data="fuzzy_cat_new")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="fuzzy_cat_back")],
+    ])
+
+
+def back_inline_keyboard(callback_data="back_to_menu"):
+    """Кнопка «Назад» в виде inline-кнопки."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ Назад", callback_data=callback_data)]
     ])
 
 
@@ -147,6 +167,7 @@ def safe_remove(*paths):
 # ─── Настройки пользователя ──────────────────────────────────────────────────
 
 async def get_user_currency(user_id) -> tuple[str, str]:
+    """Возвращает (код, символ) валюты пользователя."""
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute('SELECT currency FROM user_settings WHERE user_id = ?', (user_id,))
@@ -194,6 +215,19 @@ async def get_category_name_by_id(category_id) -> str | None:
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute('SELECT name FROM categories WHERE id = ?', (category_id,))
+            row = await cursor.fetchone()
+            return row[0] if row else None
+    except aiosqlite.Error:
+        return None
+
+
+async def get_category_name_by_id_for_user(category_id, user_id) -> str | None:
+    """Возвращает имя категории только если она принадлежит пользователю."""
+    try:
+        async with DatabaseConnection() as cursor:
+            await cursor.execute(
+                'SELECT name FROM categories WHERE id = ? AND user_id = ?',
+                (category_id, user_id))
             row = await cursor.fetchone()
             return row[0] if row else None
     except aiosqlite.Error:
@@ -261,10 +295,11 @@ async def get_category_names(user_id):
 
 
 async def get_category_id(category_name, user_id):
+    """Возвращает ID категории (поиск без учёта регистра)."""
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute(
-                'SELECT id FROM categories WHERE name = ? AND user_id = ?',
+                'SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND user_id = ?',
                 (category_name, user_id))
             row = await cursor.fetchone()
             return row[0] if row else None
@@ -273,23 +308,69 @@ async def get_category_id(category_name, user_id):
         return None
 
 
-async def resolve_category(text, user_id) -> int | None:
-    """Находит категорию по ID или имени. Возвращает category_id или None."""
-    # Пробуем как число (ID)
+async def get_category_id_and_name(category_name, user_id):
+    """Возвращает (id, реальное_имя) категории (поиск без учёта регистра)."""
     try:
-        cat_id = int(text.strip())
         async with DatabaseConnection() as cursor:
             await cursor.execute(
-                'SELECT id FROM categories WHERE id = ? AND user_id = ?',
-                (cat_id, user_id))
+                'SELECT id, name FROM categories WHERE LOWER(name) = LOWER(?) AND user_id = ?',
+                (category_name, user_id))
             row = await cursor.fetchone()
-            if row:
-                return row[0]
-    except (ValueError, aiosqlite.Error):
-        pass
+            return (row[0], row[1]) if row else (None, None)
+    except aiosqlite.Error as e:
+        logging.error(f"Ошибка get_category_id_and_name: {e}")
+        return None, None
 
-    # Пробуем как имя
-    return await get_category_id(text.strip(), user_id)
+
+def _fuzzy_ratio(a: str, b: str) -> float:
+    """Вычисляет степень сходства двух строк (0..1)."""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+async def find_fuzzy_category(input_text: str, user_id: int) -> str | None:
+    """
+    Ищет категорию, похожую на input_text, через нечёткое сравнение.
+    Возвращает имя категории если сходство >= 0.55, иначе None.
+    """
+    categories = await get_category_names(user_id)
+    best_match = None
+    best_ratio = 0.0
+    threshold = 0.55
+
+    for cat in categories:
+        ratio = _fuzzy_ratio(input_text, cat)
+        if ratio > best_ratio and ratio >= threshold:
+            best_ratio = ratio
+            best_match = cat
+
+    return best_match
+
+
+async def find_fuzzy_from_words(words: list[str], user_id: int) -> tuple[str | None, list[str]]:
+    """
+    Ищет категорию по нечёткому совпадению, перебирая префиксы слов.
+    Возвращает (matched_category, remaining_words) или (None, words).
+    """
+    if not words:
+        return None, words
+
+    categories = await get_category_names(user_id)
+    best_match = None
+    best_ratio = 0.0
+    best_length = 0
+    threshold = 0.55
+
+    for length in range(len(words), 0, -1):
+        candidate = ' '.join(words[:length])
+        for cat in categories:
+            ratio = _fuzzy_ratio(candidate, cat)
+            if ratio > best_ratio and ratio >= threshold:
+                best_ratio = ratio
+                best_match = cat
+                best_length = length
+
+    remaining = words[best_length:] if best_match else words
+    return best_match, remaining
 
 
 async def add_category(category_name, user_id):
@@ -333,9 +414,53 @@ async def delete_expenses_for_category(category_id, user_id):
         logging.error(f"Ошибка delete_expenses_for_category: {e}")
 
 
+async def merge_categories_db(source_ids: list[int], new_name: str, user_id: int) -> int | None:
+    """
+    Объединяет несколько категорий в одну с именем new_name.
+    Переносит все расходы и шаблоны в новую/первую категорию.
+    Возвращает id результирующей категории или None при ошибке.
+    """
+    try:
+        async with DatabaseConnection() as cursor:
+            # Проверяем существование целевой категории (по новому имени)
+            await cursor.execute(
+                'SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND user_id = ?',
+                (new_name, user_id))
+            existing = await cursor.fetchone()
+
+            if existing:
+                target_id = existing[0]
+            else:
+                # Создаём новую категорию
+                await cursor.execute(
+                    'INSERT INTO categories (name, user_id) VALUES (?, ?)',
+                    (new_name, user_id))
+                target_id = cursor.lastrowid
+
+            # Переносим расходы из всех исходных категорий в целевую
+            for src_id in source_ids:
+                if src_id == target_id:
+                    continue
+                await cursor.execute(
+                    'UPDATE expenses SET category_id = ? WHERE category_id = ? AND user_id = ?',
+                    (target_id, src_id, user_id))
+                await cursor.execute(
+                    'UPDATE recurring_templates SET category_id = ? WHERE category_id = ? AND user_id = ?',
+                    (target_id, src_id, user_id))
+                await cursor.execute(
+                    'DELETE FROM categories WHERE id = ? AND user_id = ?',
+                    (src_id, user_id))
+
+        return target_id
+    except aiosqlite.Error as e:
+        logging.error(f"Ошибка merge_categories_db: {e}")
+        return None
+
+
 # ─── Расходы ─────────────────────────────────────────────────────────────────
 
 async def log_expense(user_id, category_id, name, price, quantity, total) -> int | None:
+    """Записывает расход и возвращает его ID (для отмены)."""
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute('''
@@ -350,6 +475,7 @@ async def log_expense(user_id, category_id, name, price, quantity, total) -> int
 
 
 async def delete_expense_by_id(expense_id, user_id) -> bool:
+    """Удаляет конкретную трату (для отмены). Проверяет владельца."""
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute(
@@ -411,7 +537,7 @@ async def get_all_expenses(user_id):
         return []
 
 
-# ─── Шаблоны ─────────────────────────────────────────────────────────────────
+# ─── Шаблоны повторяющихся трат ──────────────────────────────────────────────
 
 async def add_template(user_id, category_id, name, amount, day_of_month) -> int | None:
     try:
@@ -441,34 +567,6 @@ async def get_templates(user_id):
         return []
 
 
-async def get_template_by_id(template_id, user_id):
-    """Возвращает (id, category_name, name, amount, day_of_month, category_id) или None."""
-    try:
-        async with DatabaseConnection() as cursor:
-            await cursor.execute('''
-                SELECT t.id, c.name, t.name, t.amount, t.day_of_month, t.category_id
-                FROM recurring_templates t
-                JOIN categories c ON t.category_id = c.id
-                WHERE t.id = ? AND t.user_id = ?
-            ''', (template_id, user_id))
-            return await cursor.fetchone()
-    except aiosqlite.Error as e:
-        logging.error(f"Ошибка get_template_by_id: {e}")
-        return None
-
-
-async def update_template(template_id, user_id, category_id, name, amount, day_of_month):
-    try:
-        async with DatabaseConnection() as cursor:
-            await cursor.execute('''
-                UPDATE recurring_templates
-                SET category_id = ?, name = ?, amount = ?, day_of_month = ?
-                WHERE id = ? AND user_id = ?
-            ''', (category_id, name, amount, day_of_month, template_id, user_id))
-    except aiosqlite.Error as e:
-        logging.error(f"Ошибка update_template: {e}")
-
-
 async def delete_template(template_id, user_id):
     try:
         async with DatabaseConnection() as cursor:
@@ -480,6 +578,7 @@ async def delete_template(template_id, user_id):
 
 
 async def get_templates_for_today():
+    """Получает все шаблоны, у которых день совпадает с сегодняшним."""
     today = datetime.now(ALMATY_TZ).day
     try:
         async with DatabaseConnection() as cursor:
@@ -495,29 +594,18 @@ async def get_templates_for_today():
         return []
 
 
-# ─── Форматирование списка шаблонов ──────────────────────────────────────────
-
-async def format_templates_list(user_id) -> str | None:
-    """Формирует текст списка шаблонов. Возвращает None если шаблонов нет."""
-    templates = await get_templates(user_id)
-    _, symbol = await get_user_currency(user_id)
-    if not templates:
-        return None
-    lines = []
-    for tpl_id, cat_name, tpl_name, amount, day in templates:
-        label = f"{cat_name} — {tpl_name}" if tpl_name else cat_name
-        lines.append(f"{tpl_id}: {label}, {amount:.0f} {symbol}, {day}-го числа")
-    return "\n".join(lines)
-
-
 # ─── Парсер свободного формата ────────────────────────────────────────────────
 
 def extract_numbers_and_words(text: str) -> tuple[list[float], list[str]]:
+    """Разделяет текст на числа и слова, убирая суффиксы валют."""
+    # Убираем суффиксы валют после чисел: 100р, 500руб, 200₸, 300тг
     cleaned = re.sub(
         r'(\d+(?:[.,]\d+)?)\s*(?:р(?:уб(?:лей|ля)?)?|₸|тг|тенге|сум|сом)\.?',
         r'\1', text, flags=re.IGNORECASE
     )
+    # Десятичная запятая → точка
     cleaned = re.sub(r'(\d+),(\d+)', r'\1.\2', cleaned)
+
     tokens = cleaned.split()
     numbers, words = [], []
     for token in tokens:
@@ -529,10 +617,16 @@ def extract_numbers_and_words(text: str) -> tuple[list[float], list[str]]:
 
 
 async def parse_free_form(text: str, user_id: int) -> dict | None:
+    """
+    Парсит свободный ввод: 'Продукты яблоки 100', 'такси 500', '100' и т.д.
+    Возвращает dict с ключами: category, name, price, quantity, total
+    или None если не удалось распарсить.
+    """
     numbers, words = extract_numbers_and_words(text)
     if not numbers:
         return None
 
+    # Пытаемся найти категорию с начала слов (жадный поиск — самое длинное совпадение)
     categories = await get_category_names(user_id)
     matched_category = None
     name_words = words
@@ -550,15 +644,20 @@ async def parse_free_form(text: str, user_id: int) -> dict | None:
     name = ' '.join(name_words).strip() if name_words else None
 
     if len(numbers) >= 2:
-        price, quantity = numbers[0], numbers[1]
+        price = numbers[0]
+        quantity = numbers[1]
         total = price * quantity
     else:
-        price = quantity = None
+        price = None
+        quantity = None
         total = numbers[0]
 
     return {
-        'category': matched_category, 'name': name,
-        'price': price, 'quantity': quantity, 'total': total,
+        'category': matched_category,
+        'name': name,
+        'price': price,
+        'quantity': quantity,
+        'total': total,
     }
 
 
@@ -583,7 +682,8 @@ async def create_pie_chart(data, user_id, currency_symbol='₸'):
         return f"{pct:.1f}%\n({absolute} {currency_symbol})"
 
     plt.figure(figsize=(10, 6))
-    plt.pie(totals, labels=categories, autopct=lambda pct: func(pct, totals), startangle=140)
+    plt.pie(totals, labels=categories, autopct=lambda pct: func(
+        pct, totals), startangle=140)
     plt.title('Расходы по категориям')
     chart_file = f'expenses_pie_chart_{user_id}.png'
     plt.savefig(chart_file)
@@ -609,7 +709,8 @@ async def generate_excel_report(start_date, end_date, user_id) -> str | None:
         if not expenses:
             return None
 
-        df = pd.DataFrame(expenses, columns=['category', 'expense', 'price', 'quantity', 'total', 'date'])
+        df = pd.DataFrame(expenses, columns=[
+                          'category', 'expense', 'price', 'quantity', 'total', 'date'])
         bold_font = Font(bold=True)
 
         with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
@@ -619,22 +720,31 @@ async def generate_excel_report(start_date, end_date, user_id) -> str | None:
 
             for category, group in df.groupby('category'):
                 total_sum = group['total'].sum()
-                worksheet.cell(row=start_row, column=start_col, value=str(category))
-                worksheet.cell(row=start_row, column=start_col + 4, value=f"{total_sum:.2f}")
+                worksheet.cell(row=start_row, column=start_col,
+                               value=str(category))
+                worksheet.cell(row=start_row, column=start_col +
+                               4, value=f"{total_sum:.2f}")
                 start_row += 2
 
                 for i, header in enumerate(["Наименование", "Цена", "Количество", "Сумма", "Дата"]):
-                    cell = worksheet.cell(row=start_row, column=start_col + i, value=header)
+                    cell = worksheet.cell(
+                        row=start_row, column=start_col + i, value=header)
                     cell.font = bold_font
 
                 start_row += 1
                 for _, row in group.iterrows():
-                    worksheet.cell(row=start_row, column=start_col, value=row['expense'] or '---')
-                    worksheet.cell(row=start_row, column=start_col + 1, value=row['price'] or '---')
-                    worksheet.cell(row=start_row, column=start_col + 2, value=row['quantity'] or '---')
-                    worksheet.cell(row=start_row, column=start_col + 3, value=row['total'])
-                    date_val = datetime.strptime(row['date'], "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
-                    worksheet.cell(row=start_row, column=start_col + 4, value=date_val)
+                    worksheet.cell(row=start_row, column=start_col,
+                                   value=row['expense'] or '---')
+                    worksheet.cell(row=start_row, column=start_col +
+                                   1, value=row['price'] or '---')
+                    worksheet.cell(row=start_row, column=start_col +
+                                   2, value=row['quantity'] or '---')
+                    worksheet.cell(
+                        row=start_row, column=start_col + 3, value=row['total'])
+                    date_val = datetime.strptime(
+                        row['date'], "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
+                    worksheet.cell(
+                        row=start_row, column=start_col + 4, value=date_val)
                     start_row += 1
 
                 start_row = 1
@@ -661,13 +771,22 @@ async def get_period_dates(period: str) -> tuple[str, str]:
 # ─── Ежемесячное сравнение ────────────────────────────────────────────────────
 
 async def send_monthly_comparisons():
+    """Отправляет сравнение прошлого месяца с позапрошлым всем активным пользователям."""
     try:
         now = datetime.now(ALMATY_TZ)
-        first_of_current = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        first_of_current = now.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        # Прошлый месяц
         last_month_end = first_of_current - timedelta(seconds=1)
-        last_month_start = last_month_end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_month_start = last_month_end.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        # Позапрошлый месяц
         prev_month_end = last_month_start - timedelta(seconds=1)
-        prev_month_start = prev_month_end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        prev_month_start = prev_month_end.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0)
+
         fmt = "%Y-%m-%d %H:%M:%S"
 
         async with DatabaseConnection() as cursor:
@@ -677,8 +796,11 @@ async def send_monthly_comparisons():
         for (user_id,) in users:
             try:
                 _, symbol = await get_user_currency(user_id)
-                last = await get_expenses(last_month_start.strftime(fmt), last_month_end.strftime(fmt), user_id)
-                prev = await get_expenses(prev_month_start.strftime(fmt), prev_month_end.strftime(fmt), user_id)
+
+                last = await get_expenses(
+                    last_month_start.strftime(fmt), last_month_end.strftime(fmt), user_id)
+                prev = await get_expenses(
+                    prev_month_start.strftime(fmt), prev_month_end.strftime(fmt), user_id)
 
                 if not last and not prev:
                     continue
@@ -687,11 +809,17 @@ async def send_monthly_comparisons():
                 prev_dict = {cat: total for cat, total in prev}
                 all_cats = sorted(set(last_dict) | set(prev_dict))
 
-                report = f"📊 Сравнение: {last_month_start.strftime('%B %Y')} vs {prev_month_start.strftime('%B %Y')}\n\n"
+                last_month_name = last_month_start.strftime("%B %Y")
+                prev_month_name = prev_month_start.strftime("%B %Y")
+
+                report = f"📊 Сравнение: {last_month_name} vs {prev_month_name}\n\n"
+                total_last = sum(last_dict.values())
+                total_prev = sum(prev_dict.values())
 
                 for cat in all_cats:
                     cur = last_dict.get(cat, 0)
                     prv = prev_dict.get(cat, 0)
+
                     if prv > 0:
                         change = ((cur - prv) / prv) * 100
                         arrow = "📈" if change > 0 else "📉" if change < 0 else "➡️"
@@ -699,17 +827,18 @@ async def send_monthly_comparisons():
                     elif cur > 0:
                         report += f"🆕 {cat}: {cur:.0f} {symbol} (новая)\n"
 
-                total_last = sum(last_dict.values())
-                total_prev = sum(prev_dict.values())
                 if total_prev > 0:
-                    total_change = ((total_last - total_prev) / total_prev) * 100
+                    total_change = (
+                        (total_last - total_prev) / total_prev) * 100
                     report += f"\nИтого: {total_last:.0f} {symbol} ({total_change:+.0f}% к прошлому)"
                 else:
                     report += f"\nИтого: {total_last:.0f} {symbol}"
 
                 await app.send_message(user_id, report)
+
             except Exception as e:
-                logging.error(f"Ошибка сравнения для {user_id}: {e}")
+                logging.error(f"Ошибка отправки сравнения для {user_id}: {e}")
+
     except Exception as e:
         logging.error(f"Ошибка send_monthly_comparisons: {e}")
 
@@ -717,6 +846,7 @@ async def send_monthly_comparisons():
 # ─── Напоминания по шаблонам ─────────────────────────────────────────────────
 
 async def send_template_reminders():
+    """Отправляет напоминания по шаблонам, у которых день совпадает с сегодняшним."""
     try:
         templates = await get_templates_for_today()
         for tpl_id, user_id, cat_name, tpl_name, amount, category_id in templates:
@@ -724,9 +854,14 @@ async def send_template_reminders():
                 _, symbol = await get_user_currency(user_id)
                 label = f"{cat_name} — {tpl_name}" if tpl_name else cat_name
                 text = f"🔔 Напоминание: {label}, {amount:.0f} {symbol}\nЗаписать трату?"
-                await app.send_message(user_id, text, reply_markup=template_confirm_keyboard(tpl_id))
+
+                await app.send_message(
+                    user_id, text,
+                    reply_markup=template_confirm_keyboard(tpl_id)
+                )
             except Exception as e:
-                logging.error(f"Ошибка напоминания шаблона {tpl_id} для {user_id}: {e}")
+                logging.error(
+                    f"Ошибка напоминания шаблона {tpl_id} для {user_id}: {e}")
     except Exception as e:
         logging.error(f"Ошибка send_template_reminders: {e}")
 
@@ -754,7 +889,7 @@ async def send_pinned_template_message(client, message):
         logging.error(f"Ошибка при закреплении: {e}")
 
 
-# ─── Обработчики ─────────────────────────────────────────────────────────────
+# ─── Обработчики: категории ──────────────────────────────────────────────────
 
 async def handle_delete_category(message, category_id):
     user_id = message.from_user.id
@@ -766,9 +901,11 @@ async def handle_delete_category(message, category_id):
         await message.reply("По этой категории есть траты. Удалить?", reply_markup=confirm_kb)
     else:
         await delete_category(category_id, user_id)
-        await message.reply("Категория удалена.", reply_markup=category_submenu)
+        await message.reply("Категория удалена.", reply_markup=main_keyboard)
         await reset_user_state(user_id)
 
+
+# ─── Обработчики: отчёты ─────────────────────────────────────────────────────
 
 async def handle_report(message):
     await message.reply("Выберите период:", reply_markup=period_keyboard)
@@ -780,7 +917,8 @@ async def handle_report_category(message):
     categories = await get_category_names(user_id)
     if categories:
         kb = ReplyKeyboardMarkup(
-            [[KeyboardButton(c)] for c in categories] + [[KeyboardButton("Назад")]],
+            [[KeyboardButton(c)] for c in categories] +
+            [[KeyboardButton("Назад")]],
             resize_keyboard=True, one_time_keyboard=True)
         await message.reply("Выберите категорию:", reply_markup=kb)
         await set_user_state(user_id, "choose_category")
@@ -790,6 +928,11 @@ async def handle_report_category(message):
 
 async def handle_choose_category(message, text):
     user_id = message.from_user.id
+    if text == "Назад":
+        await message.reply("Главное меню.", reply_markup=main_keyboard)
+        await reset_user_state(user_id)
+        return
+
     if text in await get_category_names(user_id):
         await set_user_state(user_id, "choose_period", {"category": text})
         await message.reply(f"Категория: {text}. Выберите период:", reply_markup=period_keyboard)
@@ -799,9 +942,13 @@ async def handle_choose_category(message, text):
 
 async def handle_period_report(message, period, data):
     user_id = message.from_user.id
+    if period == "Назад":
+        await message.reply("Главное меню.", reply_markup=main_keyboard)
+        await reset_user_state(user_id)
+        return
     if period == "Ввести даты вручную":
         await set_user_state(user_id, "manual_dates", data or {})
-        await message.reply("Введите даты: YYYY-MM-DD YYYY-MM-DD", reply_markup=back_keyboard)
+        await message.reply("Введите даты: YYYY-MM-DD YYYY-MM-DD", reply_markup=ForceReply())
         return
     if period not in ("День", "Неделя", "Месяц", "Квартал", "Год"):
         await message.reply("Неверный период.", reply_markup=period_keyboard)
@@ -862,7 +1009,30 @@ async def _send_report(message, start_date, end_date, user_id, category=None):
         safe_remove(chart_file, excel_file)
 
 
-# ─── Ввод трат ───────────────────────────────────────────────────────────────
+# ─── Обработчик ввода трат (свободный + точный формат) ────────────────────────
+
+async def _propose_fuzzy_category(message, fuzzy_cat_name: str, expense_data: dict, user_id: int):
+    """Предлагает пользователю нечётко найденную категорию."""
+    await set_user_state(user_id, "pending_fuzzy_category", {
+        **expense_data,
+        "fuzzy_cat_name": fuzzy_cat_name,
+    })
+    input_name = expense_data.get('proposed_input', '')
+    prefix = f"Категория «{input_name}» не найдена, но есть «{fuzzy_cat_name}».\n" \
+        if input_name else f"Найдена похожая категория «{fuzzy_cat_name}».\n"
+    await message.reply(prefix + "Использовать её?", reply_markup=fuzzy_category_keyboard())
+
+
+async def _propose_create_category(message, proposed_name: str, expense_data: dict, user_id: int):
+    """Предлагает пользователю создать новую категорию."""
+    await set_user_state(user_id, "pending_create_category", {
+        **expense_data,
+        "proposed_cat_name": proposed_name,
+    })
+    await message.reply(
+        f"Категория «{proposed_name}» не найдена.\nСоздать её?",
+        reply_markup=create_category_keyboard())
+
 
 async def handle_expense_entry(message, text):
     user_id = message.from_user.id
@@ -874,17 +1044,25 @@ async def handle_expense_entry(message, text):
 
         if len(parts) == 4:
             try:
-                category, name, price, quantity = parts
+                category_input, name, price, quantity = parts
                 price, quantity = float(price), float(quantity)
                 total = price * quantity
-                category_id = await get_category_id(category, user_id)
+                category_id, category_real = await get_category_id_and_name(category_input, user_id)
                 if category_id is None:
-                    await message.reply(f"Категория '{category}' не найдена. Добавьте сначала.")
+                    expense_data = {
+                        'name': name, 'price': price, 'quantity': quantity, 'total': total,
+                        'proposed_input': category_input,
+                    }
+                    fuzzy_cat = await find_fuzzy_category(category_input, user_id)
+                    if fuzzy_cat:
+                        await _propose_fuzzy_category(message, fuzzy_cat, expense_data, user_id)
+                    else:
+                        await _propose_create_category(message, category_input, expense_data, user_id)
                     return
                 expense_id = await log_expense(user_id, category_id, name, price, quantity, total)
                 await set_last_category_id(user_id, category_id)
                 await message.reply(
-                    f"✅ {category} — {name}: {total:.2f} {symbol}",
+                    f"✅ {category_real} — {name}: {total:.2f} {symbol}",
                     reply_markup=undo_keyboard(expense_id))
             except ValueError:
                 await message.reply("Неверный формат. Используйте: Категория, Наименование, Цена, Количество")
@@ -892,15 +1070,23 @@ async def handle_expense_entry(message, text):
 
         if len(parts) == 2:
             try:
-                category, total = parts[0], float(parts[1])
-                category_id = await get_category_id(category, user_id)
+                category_input, total = parts[0], float(parts[1])
+                category_id, category_real = await get_category_id_and_name(category_input, user_id)
                 if category_id is None:
-                    await message.reply(f"Категория '{category}' не найдена. Добавьте сначала.")
+                    expense_data = {
+                        'name': None, 'price': None, 'quantity': None, 'total': total,
+                        'proposed_input': category_input,
+                    }
+                    fuzzy_cat = await find_fuzzy_category(category_input, user_id)
+                    if fuzzy_cat:
+                        await _propose_fuzzy_category(message, fuzzy_cat, expense_data, user_id)
+                    else:
+                        await _propose_create_category(message, category_input, expense_data, user_id)
                     return
                 expense_id = await log_expense(user_id, category_id, None, None, None, total)
                 await set_last_category_id(user_id, category_id)
                 await message.reply(
-                    f"✅ {category}: {total:.2f} {symbol}",
+                    f"✅ {category_real}: {total:.2f} {symbol}",
                     reply_markup=undo_keyboard(expense_id))
             except ValueError:
                 await message.reply("Неверный формат. Используйте: Категория, Сумма")
@@ -924,27 +1110,85 @@ async def handle_expense_entry(message, text):
         return
 
     if parsed['category']:
+        # Категория найдена — записываем сразу
         category_id = await get_category_id(parsed['category'], user_id)
         expense_id = await log_expense(
             user_id, category_id, parsed['name'],
             parsed['price'], parsed['quantity'], parsed['total'])
         await set_last_category_id(user_id, category_id)
+
         label = f"{parsed['category']} — {parsed['name']}" if parsed['name'] else parsed['category']
         await message.reply(
             f"✅ {label}: {parsed['total']:.2f} {symbol}",
             reply_markup=undo_keyboard(expense_id))
-    else:
+        return
+
+    # Категория не найдена в свободном формате
+    numbers, words = extract_numbers_and_words(text)
+
+    if words:
+        # Есть слова — пробуем нечёткий поиск по префиксам слов
+        fuzzy_cat, remaining_words = await find_fuzzy_from_words(words, user_id)
+        if fuzzy_cat:
+            # Нашли нечёткое совпадение
+            input_candidate = ' '.join(
+                words[:len(words) - len(remaining_words)])
+            expense_data = {
+                'name': ' '.join(remaining_words).strip() or parsed.get('name'),
+                'price': parsed['price'],
+                'quantity': parsed['quantity'],
+                'total': parsed['total'],
+                'proposed_input': input_candidate,
+            }
+            await _propose_fuzzy_category(message, fuzzy_cat, expense_data, user_id)
+            return
+
+        # Нечёткого совпадения нет — предлагаем последнюю категорию или создать
         last_cat_id = await get_last_category_id(user_id)
         if last_cat_id:
             last_cat_name = await get_category_name_by_id(last_cat_id)
             if last_cat_name:
                 await set_user_state(user_id, "pending_expense", {
-                    "name": parsed['name'], "price": parsed['price'],
-                    "quantity": parsed['quantity'], "total": parsed['total'],
-                    "category_id": last_cat_id, "category_name": last_cat_name,
+                    "name": parsed['name'],
+                    "price": parsed['price'],
+                    "quantity": parsed['quantity'],
+                    "total": parsed['total'],
+                    "category_id": last_cat_id,
+                    "category_name": last_cat_name,
                 })
                 label = f"{parsed['name']} {parsed['total']:.2f}" if parsed['name'] \
                     else f"{parsed['total']:.2f}"
+                await message.reply(
+                    f"Записать «{label} {symbol}» в категорию «{last_cat_name}»?",
+                    reply_markup=confirm_category_keyboard())
+                return
+
+        # Предлагаем создать категорию из первого слова
+        proposed_name = words[0] if words else text.strip()
+        expense_data = {
+            'name': parsed.get('name'),
+            'price': parsed['price'],
+            'quantity': parsed['quantity'],
+            'total': parsed['total'],
+            'proposed_input': proposed_name,
+        }
+        await _propose_create_category(message, proposed_name, expense_data, user_id)
+
+    else:
+        # Нет слов (только числа) — предлагаем последнюю категорию
+        last_cat_id = await get_last_category_id(user_id)
+        if last_cat_id:
+            last_cat_name = await get_category_name_by_id(last_cat_id)
+            if last_cat_name:
+                await set_user_state(user_id, "pending_expense", {
+                    "name": parsed['name'],
+                    "price": parsed['price'],
+                    "quantity": parsed['quantity'],
+                    "total": parsed['total'],
+                    "category_id": last_cat_id,
+                    "category_name": last_cat_name,
+                })
+                label = f"{parsed['total']:.2f}"
                 await message.reply(
                     f"Записать «{label} {symbol}» в категорию «{last_cat_name}»?",
                     reply_markup=confirm_category_keyboard())
@@ -971,13 +1215,14 @@ async def handle_all_expenses(message):
     await send_long_message(message, report, reply_markup=main_keyboard)
 
 
-# ─── Callback-обработчик ─────────────────────────────────────────────────────
+# ─── Callback-обработчик (inline-кнопки) ─────────────────────────────────────
 
 @app.on_callback_query()
 async def handle_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     data = callback_query.data
 
+    # ── Отмена последней траты ──
     if data.startswith("undo:"):
         expense_id = int(data.split(":")[1])
         if await delete_expense_by_id(expense_id, user_id):
@@ -987,6 +1232,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         await callback_query.answer()
         return
 
+    # ── Подтверждение последней категории ──
     if data == "cat_yes":
         state, state_data = await get_user_state(user_id)
         if state != "pending_expense" or not state_data:
@@ -997,11 +1243,13 @@ async def handle_callback(client, callback_query: CallbackQuery):
         expense_id = await log_expense(
             user_id, state_data['category_id'], state_data.get('name'),
             state_data.get('price'), state_data.get('quantity'), state_data['total'])
+
         await set_last_category_id(user_id, state_data['category_id'])
         await reset_user_state(user_id)
 
         label = f"{state_data['category_name']} — {state_data['name']}" \
             if state_data.get('name') else state_data['category_name']
+
         await callback_query.message.edit_text(
             f"✅ {label}: {state_data['total']:.2f} {symbol}",
             reply_markup=undo_keyboard(expense_id))
@@ -1009,6 +1257,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         return
 
     if data == "cat_other":
+        # Сохраняем данные о трате при смене категории
         state, pending = await get_user_state(user_id)
         kb = await category_keyboard(user_id)
         await callback_query.message.edit_text("Выберите категорию:")
@@ -1017,6 +1266,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
         await callback_query.answer()
         return
 
+    # ── Подтверждение шаблона ──
     if data.startswith("tpl_yes:"):
         tpl_id = int(data.split(":")[1])
         try:
@@ -1030,7 +1280,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
                 row = await cursor.fetchone()
 
             if row and row[0] == user_id:
-                _, cat_id, tpl_name, amount, cat_name = row
+                tpl_user_id, cat_id, tpl_name, amount, cat_name = row
                 _, symbol = await get_user_currency(user_id)
                 expense_id = await log_expense(user_id, cat_id, tpl_name, None, None, amount)
                 label = f"{cat_name} — {tpl_name}" if tpl_name else cat_name
@@ -1050,10 +1300,128 @@ async def handle_callback(client, callback_query: CallbackQuery):
         await callback_query.answer()
         return
 
+    # ── Возврат в главное меню ──
+    if data == "back_to_menu":
+        await reset_user_state(user_id)
+        await callback_query.message.edit_text("Главное меню.")
+        await app.send_message(user_id, "Главное меню.", reply_markup=main_keyboard)
+        await callback_query.answer()
+        return
+
+    # ── Создание новой категории для ожидающей траты ──
+    if data == "create_cat_yes":
+        state, state_data = await get_user_state(user_id)
+        if state != "pending_create_category" or not state_data:
+            await callback_query.answer("Данные устарели, введите трату заново.")
+            return
+
+        cat_name = state_data.get('proposed_cat_name', '')
+        _, symbol = await get_user_currency(user_id)
+
+        if not cat_name:
+            await callback_query.answer("Не удалось определить имя категории.")
+            return
+
+        await add_category(cat_name, user_id)
+        category_id = await get_category_id(cat_name, user_id)
+
+        if category_id is None:
+            await callback_query.message.edit_text("Ошибка создания категории.")
+            await callback_query.answer()
+            return
+
+        expense_id = await log_expense(
+            user_id, category_id, state_data.get('name'),
+            state_data.get('price'), state_data.get('quantity'), state_data['total'])
+        await set_last_category_id(user_id, category_id)
+        await reset_user_state(user_id)
+
+        label = f"{cat_name} — {state_data['name']}" if state_data.get(
+            'name') else cat_name
+        await callback_query.message.edit_text(
+            f"✅ Категория «{cat_name}» создана.\n"
+            f"✅ {label}: {state_data['total']:.2f} {symbol}",
+            reply_markup=undo_keyboard(expense_id))
+        await callback_query.answer()
+        return
+
+    if data == "create_cat_no":
+        state, state_data = await get_user_state(user_id)
+        # Переводим в режим выбора категории для записи траты
+        await set_user_state(user_id, "choose_category_for_expense", {
+            k: v for k, v in state_data.items() if k != 'proposed_cat_name'
+        })
+        kb = await category_keyboard(user_id)
+        await callback_query.message.edit_text(
+            "Трата должна быть привязана к категории.\n"
+            "Выберите существующую категорию или создайте новую через меню «Категории»."
+        )
+        await app.send_message(user_id, "Выберите категорию:", reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    # ── Нечёткое совпадение категории ──
+    if data == "fuzzy_cat_yes":
+        state, state_data = await get_user_state(user_id)
+        if state != "pending_fuzzy_category" or not state_data:
+            await callback_query.answer("Данные устарели, введите трату заново.")
+            return
+
+        fuzzy_cat_name = state_data.get('fuzzy_cat_name', '')
+        _, symbol = await get_user_currency(user_id)
+
+        category_id = await get_category_id(fuzzy_cat_name, user_id)
+        if category_id is None:
+            await callback_query.message.edit_text("Категория не найдена.")
+            await callback_query.answer()
+            return
+
+        expense_id = await log_expense(
+            user_id, category_id, state_data.get('name'),
+            state_data.get('price'), state_data.get('quantity'), state_data['total'])
+        await set_last_category_id(user_id, category_id)
+        await reset_user_state(user_id)
+
+        label = f"{fuzzy_cat_name} — {state_data['name']}" if state_data.get(
+            'name') else fuzzy_cat_name
+        await callback_query.message.edit_text(
+            f"✅ {label}: {state_data['total']:.2f} {symbol}",
+            reply_markup=undo_keyboard(expense_id))
+        await callback_query.answer()
+        return
+
+    if data == "fuzzy_cat_new":
+        state, state_data = await get_user_state(user_id)
+        if state != "pending_fuzzy_category" or not state_data:
+            await callback_query.answer("Данные устарели, введите трату заново.")
+            return
+
+        # Предлагаем создать новую категорию с тем именем, что ввёл пользователь
+        proposed_name = state_data.get('proposed_input', '')
+        new_state_data = {
+            k: v for k, v in state_data.items()
+            if k not in ('fuzzy_cat_name',)
+        }
+        new_state_data['proposed_cat_name'] = proposed_name
+
+        await set_user_state(user_id, "pending_create_category", new_state_data)
+        await callback_query.message.edit_text(
+            f"Создать категорию «{proposed_name}»?",
+            reply_markup=create_category_keyboard())
+        await callback_query.answer()
+        return
+
+    if data == "fuzzy_cat_back":
+        await reset_user_state(user_id)
+        await callback_query.message.edit_text("Отменено.")
+        await app.send_message(user_id, "Главное меню.", reply_markup=main_keyboard)
+        await callback_query.answer()
+        return
+
     await callback_query.answer()
 
 
-# ─── Главный обработчик ──────────────────────────────────────────────────────
+# ─── Главный обработчик сообщений ────────────────────────────────────────────
 
 @app.on_message(filters.text & filters.private)
 async def handle_message(client, message):
@@ -1063,13 +1431,6 @@ async def handle_message(client, message):
 
     state, data = await get_user_state(user_id)
 
-    # ── "Назад" — глобальный, работает из любого состояния ──
-
-    if text == "Назад":
-        await message.reply("Главное меню.", reply_markup=main_keyboard)
-        await reset_user_state(user_id)
-        return
-
     # ── Команды ──
 
     if text == "/start":
@@ -1077,7 +1438,10 @@ async def handle_message(client, message):
             "Привет! Я помогу следить за расходами.\n\n"
             "Просто пиши траты в свободном формате:\n"
             "Продукты яблоки 100\n"
-            "Такси 500",
+            "Такси 500\n\n"
+            "Команды:\n"
+            "/currency KZT — установить валюту\n"
+            "/help — справка",
             reply_markup=main_keyboard)
         await send_pinned_template_message(client, message)
         await reset_user_state(user_id)
@@ -1088,21 +1452,47 @@ async def handle_message(client, message):
         if len(parts) < 2:
             _, symbol = await get_user_currency(user_id)
             codes = ', '.join(CURRENCY_SYMBOLS.keys())
-            await message.reply(f"Текущая валюта: {symbol}\nДоступные: {codes}\n\nИспользование: /currency KZT")
+            await message.reply(
+                f"Текущая валюта: {symbol}\n"
+                f"Доступные: {codes}\n\n"
+                f"Использование: /currency KZT")
             return
         code = parts[1].upper()
         if code not in CURRENCY_SYMBOLS:
             await message.reply(f"Неизвестная валюта. Доступные: {', '.join(CURRENCY_SYMBOLS.keys())}")
             return
         await set_user_currency(user_id, code)
-        await message.reply(f"Валюта: {CURRENCY_SYMBOLS[code]} ({code})", reply_markup=main_keyboard)
+        await message.reply(f"Валюта установлена: {CURRENCY_SYMBOLS[code]} ({code})", reply_markup=main_keyboard)
         return
 
     if text == "/help":
-        await _send_help(message)
+        await message.reply(
+            "📖 Как пользоваться:\n\n"
+            "Свободный формат:\n"
+            "  Продукты яблоки 100\n"
+            "  Такси 500\n"
+            "  Еда пицца 400р\n\n"
+            "Точный формат:\n"
+            "  Продукты, Яблоки, 100, 2\n"
+            "  Такси, 500\n\n"
+            "Если категория не указана — бот предложит последнюю использованную.\n\n"
+            "Команды:\n"
+            "/currency KZT — установить валюту (KZT, RUB, USD, EUR...)\n"
+            "/help — эта справка\n\n"
+            "Кнопки:\n"
+            "Категории — управление категориями\n"
+            "Шаблоны — повторяющиеся траты\n"
+            "Отчет — отчёт за период\n"
+            "Все траты — полный список",
+            reply_markup=main_keyboard)
         return
 
-    # ── Главное меню ──
+    # ── Меню ──
+
+    if text == "Назад":
+        await message.reply("Главное меню.", reply_markup=main_keyboard)
+        await reset_user_state(user_id)
+        return
 
     if text == "Категории":
         await message.reply("Выберите действие:", reply_markup=category_submenu)
@@ -1117,7 +1507,7 @@ async def handle_message(client, message):
         return
 
     if text == "Добавить категорию":
-        await message.reply("Введите название категории:", reply_markup=back_keyboard)
+        await message.reply("Введите название категории:", reply_markup=ForceReply())
         await set_user_state(user_id, "adding_category")
         return
 
@@ -1125,12 +1515,30 @@ async def handle_message(client, message):
         categories = await get_categories(user_id)
         if categories:
             await message.reply(
-                "Ваши категории:\n" + "\n".join(categories) +
-                "\n\nВведите id или название категории для удаления:",
-                reply_markup=back_keyboard)
+                "Ваши категории:\n" +
+                "\n".join(categories) + "\n\nВведите id для удаления:",
+                reply_markup=ForceReply())
             await set_user_state(user_id, "delete_category")
         else:
             await message.reply("Категорий пока нет.", reply_markup=category_submenu)
+        return
+
+    if text == "Объединить категории":
+        categories = await get_categories(user_id)
+        if len(categories) < 2:
+            await message.reply(
+                "Для объединения нужно минимум две категории.",
+                reply_markup=category_submenu)
+            return
+        back_kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("Назад")]],
+            resize_keyboard=True, one_time_keyboard=True)
+        await message.reply(
+            "Ваши категории:\n" + "\n".join(categories) +
+            "\n\nВведите id или названия категорий для объединения "
+            "(через запятую или пробел).\nПример: 1, 3  или  Такси, тахи",
+            reply_markup=back_kb)
+        await set_user_state(user_id, "merge_categories_input")
         return
 
     if text == "Отчет":
@@ -1145,27 +1553,6 @@ async def handle_message(client, message):
         await handle_all_expenses(message)
         return
 
-    # ── Настройки ──
-
-    if text == "Настройки":
-        await message.reply("⚙️ Настройки:", reply_markup=settings_submenu)
-        await reset_user_state(user_id)
-        return
-
-    if text == "Валюта":
-        _, symbol = await get_user_currency(user_id)
-        codes = ', '.join(CURRENCY_SYMBOLS.keys())
-        await message.reply(
-            f"Текущая валюта: {symbol}\nДоступные: {codes}\n\n"
-            f"Введите код валюты (например KZT):",
-            reply_markup=back_keyboard)
-        await set_user_state(user_id, "set_currency")
-        return
-
-    if text == "Справка":
-        await _send_help(message)
-        return
-
     # ── Шаблоны ──
 
     if text == "Шаблоны":
@@ -1174,8 +1561,17 @@ async def handle_message(client, message):
         return
 
     if text == "Мои шаблоны":
-        tpl_text = await format_templates_list(user_id)
-        await message.reply(tpl_text or "Шаблонов пока нет.", reply_markup=template_submenu)
+        templates = await get_templates(user_id)
+        _, symbol = await get_user_currency(user_id)
+        if templates:
+            lines = []
+            for tpl_id, cat_name, tpl_name, amount, day in templates:
+                label = f"{cat_name} — {tpl_name}" if tpl_name else cat_name
+                lines.append(
+                    f"{tpl_id}: {label}, {amount:.0f} {symbol}, {day}-го числа")
+            await message.reply("\n".join(lines), reply_markup=template_submenu)
+        else:
+            await message.reply("Шаблонов пока нет.", reply_markup=template_submenu)
         return
 
     if text == "Добавить шаблон":
@@ -1184,45 +1580,28 @@ async def handle_message(client, message):
             "Категория, Наименование, Сумма, День\n\n"
             "Пример: Аренда, Квартира, 150000, 5\n"
             "Или: Аренда, 150000, 5",
-            reply_markup=back_keyboard)
+            reply_markup=ForceReply())
         await set_user_state(user_id, "adding_template")
         return
 
-    if text == "Редактировать шаблон":
-        tpl_text = await format_templates_list(user_id)
-        if tpl_text:
-            await message.reply(
-                tpl_text + "\n\nВведите id шаблона для редактирования:",
-                reply_markup=back_keyboard)
-            await set_user_state(user_id, "edit_template_select")
-        else:
-            await message.reply("Шаблонов пока нет.", reply_markup=template_submenu)
-        return
-
     if text == "Удалить шаблон":
-        tpl_text = await format_templates_list(user_id)
-        if tpl_text:
+        templates = await get_templates(user_id)
+        _, symbol = await get_user_currency(user_id)
+        if templates:
+            lines = []
+            for tpl_id, cat_name, tpl_name, amount, day in templates:
+                label = f"{cat_name} — {tpl_name}" if tpl_name else cat_name
+                lines.append(
+                    f"{tpl_id}: {label}, {amount:.0f} {symbol}, {day}-го числа")
             await message.reply(
-                tpl_text + "\n\nВведите id шаблона для удаления:",
-                reply_markup=back_keyboard)
+                "\n".join(lines) + "\n\nВведите id шаблона для удаления:",
+                reply_markup=ForceReply())
             await set_user_state(user_id, "delete_template")
         else:
             await message.reply("Шаблонов пока нет.", reply_markup=template_submenu)
         return
 
     # ── Обработка состояний ──
-
-    if state == "set_currency":
-        code = text.upper()
-        if code not in CURRENCY_SYMBOLS:
-            await message.reply(
-                f"Неизвестная валюта. Доступные: {', '.join(CURRENCY_SYMBOLS.keys())}",
-                reply_markup=back_keyboard)
-            return
-        await set_user_currency(user_id, code)
-        await message.reply(f"Валюта: {CURRENCY_SYMBOLS[code]} ({code})", reply_markup=main_keyboard)
-        await reset_user_state(user_id)
-        return
 
     if state == "adding_category":
         name = text.strip()
@@ -1235,13 +1614,11 @@ async def handle_message(client, message):
         return
 
     if state == "delete_category":
-        category_id = await resolve_category(text, user_id)
-        if category_id is None:
-            await message.reply(
-                "Категория не найдена. Введите id или название своей категории.",
-                reply_markup=back_keyboard)
-            return
-        await handle_delete_category(message, category_id)
+        try:
+            category_id = int(text)
+            await handle_delete_category(message, category_id)
+        except ValueError:
+            await message.reply("Введите число.", reply_markup=category_submenu)
         return
 
     if state == "confirm_delete":
@@ -1279,16 +1656,19 @@ async def handle_message(client, message):
                 amount, day = float(amount), int(day)
             else:
                 await message.reply("Неверный формат. Используйте: Категория, Сумма, День",
-                                    reply_markup=back_keyboard)
+                                    reply_markup=template_submenu)
+                await reset_user_state(user_id)
                 return
 
             if not (1 <= day <= 28):
-                await message.reply("День должен быть от 1 до 28.", reply_markup=back_keyboard)
+                await message.reply("День должен быть от 1 до 28.", reply_markup=template_submenu)
+                await reset_user_state(user_id)
                 return
 
             category_id = await get_category_id(cat_name, user_id)
             if category_id is None:
-                await message.reply(f"Категория '{cat_name}' не найдена.", reply_markup=back_keyboard)
+                await message.reply(f"Категория '{cat_name}' не найдена.", reply_markup=template_submenu)
+                await reset_user_state(user_id)
                 return
 
             await add_template(user_id, category_id, tpl_name, amount, day)
@@ -1296,84 +1676,29 @@ async def handle_message(client, message):
             label = f"{cat_name} — {tpl_name}" if tpl_name else cat_name
             await message.reply(
                 f"Шаблон добавлен: {label}, {amount:.0f} {symbol}, {day}-го числа",
-                reply_markup=template_submenu)
+                reply_markup=main_keyboard)
         except ValueError:
-            await message.reply("Неверный формат числа.", reply_markup=back_keyboard)
-        await reset_user_state(user_id)
-        return
-
-    if state == "edit_template_select":
-        try:
-            tpl_id = int(text)
-            tpl = await get_template_by_id(tpl_id, user_id)
-            if not tpl:
-                await message.reply("Шаблон не найден.", reply_markup=back_keyboard)
-                return
-            _, cat_name, tpl_name, amount, day, cat_id = tpl
-            _, symbol = await get_user_currency(user_id)
-            label = f"{cat_name} — {tpl_name}" if tpl_name else cat_name
-            await message.reply(
-                f"Текущий шаблон:\n"
-                f"{label}, {amount:.0f} {symbol}, {day}-го числа\n\n"
-                f"Введите новые данные в формате:\n"
-                f"Категория, Наименование, Сумма, День\n"
-                f"Или: Категория, Сумма, День",
-                reply_markup=back_keyboard)
-            await set_user_state(user_id, "edit_template_input", {"template_id": tpl_id})
-        except ValueError:
-            await message.reply("Введите число.", reply_markup=back_keyboard)
-        return
-
-    if state == "edit_template_input":
-        template_id = data.get("template_id")
-        parts = [p.strip() for p in text.split(',')]
-        try:
-            if len(parts) == 4:
-                cat_name, tpl_name, amount, day = parts
-                amount, day = float(amount), int(day)
-            elif len(parts) == 3:
-                cat_name, amount, day = parts
-                tpl_name = None
-                amount, day = float(amount), int(day)
-            else:
-                await message.reply("Неверный формат.", reply_markup=back_keyboard)
-                return
-
-            if not (1 <= day <= 28):
-                await message.reply("День должен быть от 1 до 28.", reply_markup=back_keyboard)
-                return
-
-            category_id = await get_category_id(cat_name, user_id)
-            if category_id is None:
-                await message.reply(f"Категория '{cat_name}' не найдена.", reply_markup=back_keyboard)
-                return
-
-            await update_template(template_id, user_id, category_id, tpl_name, amount, day)
-            _, symbol = await get_user_currency(user_id)
-            label = f"{cat_name} — {tpl_name}" if tpl_name else cat_name
-            await message.reply(
-                f"Шаблон обновлён: {label}, {amount:.0f} {symbol}, {day}-го числа",
-                reply_markup=template_submenu)
-        except ValueError:
-            await message.reply("Неверный формат числа.", reply_markup=back_keyboard)
+            await message.reply("Неверный формат числа.", reply_markup=template_submenu)
         await reset_user_state(user_id)
         return
 
     if state == "delete_template":
         try:
             tpl_id = int(text)
-            tpl = await get_template_by_id(tpl_id, user_id)
-            if not tpl:
-                await message.reply("Шаблон не найден.", reply_markup=back_keyboard)
-                return
             await delete_template(tpl_id, user_id)
             await message.reply("Шаблон удалён.", reply_markup=template_submenu)
         except ValueError:
-            await message.reply("Введите число.", reply_markup=back_keyboard)
+            await message.reply("Введите число.", reply_markup=template_submenu)
         await reset_user_state(user_id)
         return
 
+    # Выбор категории для траты из pending_expense (после "Другая")
     if state == "choose_category_for_expense":
+        if text == "Назад":
+            await message.reply("Главное меню.", reply_markup=main_keyboard)
+            await reset_user_state(user_id)
+            return
+
         category_id = await get_category_id(text, user_id)
         if category_id is None:
             await message.reply("Неверная категория.", reply_markup=await category_keyboard(user_id))
@@ -1387,7 +1712,8 @@ async def handle_message(client, message):
                 user_id, category_id, pending.get('name'),
                 pending.get('price'), pending.get('quantity'), pending['total'])
             await set_last_category_id(user_id, category_id)
-            label = f"{text} — {pending['name']}" if pending.get('name') else text
+            label = f"{text} — {pending['name']}" if pending.get(
+                'name') else text
             await message.reply(
                 f"✅ {label}: {pending['total']:.2f} {symbol}",
                 reply_markup=undo_keyboard(expense_id))
@@ -1396,37 +1722,123 @@ async def handle_message(client, message):
         await reset_user_state(user_id)
         return
 
-    # ── Ввод траты ──
+    # ── Объединение категорий: шаг 1 — ввод категорий ──
+    if state == "merge_categories_input":
+        if text == "Назад":
+            await message.reply("Главное меню.", reply_markup=main_keyboard)
+            await reset_user_state(user_id)
+            return
+
+        # Разбиваем по запятым и пробелам
+        raw_tokens = re.split(r'[,\s]+', text.strip())
+        raw_tokens = [t.strip() for t in raw_tokens if t.strip()]
+
+        found_ids = []
+        not_found = []
+
+        for token in raw_tokens:
+            # Пробуем как id
+            try:
+                cat_id = int(token)
+                cat_name = await get_category_name_by_id_for_user(cat_id, user_id)
+                if cat_name:
+                    found_ids.append((cat_id, cat_name))
+                else:
+                    not_found.append(token)
+            except ValueError:
+                # Пробуем как название (case-insensitive)
+                cat_id = await get_category_id(token, user_id)
+                if cat_id is not None:
+                    cat_name = await get_category_name_by_id_for_user(cat_id, user_id)
+                    found_ids.append((cat_id, cat_name))
+                else:
+                    not_found.append(token)
+
+        # Убираем дубликаты
+        seen = set()
+        unique_found = []
+        for cat_id, cat_name in found_ids:
+            if cat_id not in seen:
+                seen.add(cat_id)
+                unique_found.append((cat_id, cat_name))
+
+        if len(unique_found) < 2:
+            back_kb = ReplyKeyboardMarkup(
+                [[KeyboardButton("Назад")]],
+                resize_keyboard=True, one_time_keyboard=True)
+            msg = "Найдено менее двух категорий"
+            if not_found:
+                msg += f"\nНе найдено: {', '.join(not_found)}"
+            msg += "\n\nВведите заново или нажмите «Назад»."
+            await message.reply(msg, reply_markup=back_kb)
+            return
+
+        names_list = "\n".join(
+            f"  • {name} (id {cid})" for cid, name in unique_found)
+        warn = ""
+        if not_found:
+            warn = f"\n\n⚠️ Не найдено: {', '.join(not_found)}"
+
+        back_kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("Назад")]],
+            resize_keyboard=True, one_time_keyboard=True)
+
+        await message.reply(
+            f"Будут объединены:\n{names_list}{warn}"
+            "\n\nКак назвать итоговую категорию?\n"
+            "(введите новое название или одно из существующих)",
+            reply_markup=back_kb)
+
+        ids_only = [cid for cid, _ in unique_found]
+        await set_user_state(user_id, "merge_categories_name", {"ids": ids_only})
+        return
+
+    # ── Объединение категорий: шаг 2 — ввод имени ──
+    if state == "merge_categories_name":
+        if text == "Назад":
+            categories = await get_categories(user_id)
+            back_kb = ReplyKeyboardMarkup(
+                [[KeyboardButton("Назад")]],
+                resize_keyboard=True, one_time_keyboard=True)
+            await message.reply(
+                "Ваши категории:\n" + "\n".join(categories) +
+                "\n\nВведите id или названия категорий для объединения.",
+                reply_markup=back_kb)
+            await set_user_state(user_id, "merge_categories_input")
+            return
+
+        new_name = text.strip()
+        if not new_name:
+            await message.reply("Название не должно быть пустым.")
+            return
+
+        ids_to_merge = data.get("ids", [])
+        result_id = await merge_categories_db(ids_to_merge, new_name, user_id)
+
+        if result_id:
+            await message.reply(
+                f"✅ Категории успешно объединены в «{new_name}».",
+                reply_markup=category_submenu)
+        else:
+            await message.reply(
+                "Ошибка при объединении категорий.",
+                reply_markup=category_submenu)
+        await reset_user_state(user_id)
+        return
+
+    # ── Ввод траты (свободный + точный формат) ──
     await handle_expense_entry(message, text)
-
-
-# ─── Справка ─────────────────────────────────────────────────────────────────
-
-async def _send_help(message):
-    await message.reply(
-        "📖 Как пользоваться:\n\n"
-        "Свободный формат:\n"
-        "  Продукты яблоки 100\n"
-        "  Такси 500\n"
-        "  Еда пицца 400р\n\n"
-        "Точный формат:\n"
-        "  Продукты, Яблоки, 100, 2\n"
-        "  Такси, 500\n\n"
-        "Если категория не указана — бот предложит последнюю.\n\n"
-        "Меню:\n"
-        "  Категории — управление категориями\n"
-        "  Шаблоны — повторяющиеся траты\n"
-        "  Отчет — отчёт за период\n"
-        "  Все траты — полный список\n"
-        "  Настройки — валюта и справка",
-        reply_markup=main_keyboard)
 
 
 # ─── Планировщик ─────────────────────────────────────────────────────────────
 
 scheduler = AsyncIOScheduler(timezone=ALMATY_TZ)
+
+# Ежемесячное сравнение — 1-го числа в 9:00
 scheduler.add_job(send_monthly_comparisons, 'cron', day=1, hour=9, minute=0,
                   id='monthly_comparison', replace_existing=True)
+
+# Напоминания по шаблонам — каждый день в 9:00
 scheduler.add_job(send_template_reminders, 'cron', hour=9, minute=0,
                   id='template_reminders', replace_existing=True)
 
