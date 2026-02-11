@@ -45,12 +45,25 @@ if not all([api_id, api_hash, bot_token]):
 app = Client("expense_bot", api_id=api_id,
              api_hash=api_hash, bot_token=bot_token)
 
-ALMATY_TZ = pytz.timezone('Asia/Almaty')
+DEFAULT_TZ = pytz.timezone('Asia/Almaty')
 MAX_MESSAGE_LENGTH = 4000
 
 CURRENCY_SYMBOLS = {
     'KZT': '₸', 'RUB': '₽', 'USD': '$', 'EUR': '€',
     'UAH': '₴', 'GBP': '£', 'UZS': 'сўм', 'KGS': 'сом',
+}
+
+POPULAR_TIMEZONES = {
+    'Алматы (UTC+6)': 'Asia/Almaty',
+    'Москва (UTC+3)': 'Europe/Moscow',
+    'Киев (UTC+2)': 'Europe/Kyiv',
+    'Ташкент (UTC+5)': 'Asia/Tashkent',
+    'Бишкек (UTC+6)': 'Asia/Bishkek',
+    'Лондон (UTC+0)': 'Europe/London',
+    'Берлин (UTC+1)': 'Europe/Berlin',
+    'Нью-Йорк (UTC-5)': 'America/New_York',
+    'Дубай (UTC+4)': 'Asia/Dubai',
+    'Стамбул (UTC+3)': 'Europe/Istanbul',
 }
 
 # ─── Клавиатуры ──────────────────────────────────────────────────────────────
@@ -104,9 +117,21 @@ report_submenu = ReplyKeyboardMarkup(
 
 service_submenu = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("Валюта"), KeyboardButton("Справка")],
+        [KeyboardButton("Валюта"), KeyboardButton("Часовой пояс")],
         [KeyboardButton("Редактировать траты"),
          KeyboardButton("Удалить траты")],
+        [KeyboardButton("Справка"), KeyboardButton("Назад")],
+    ],
+    resize_keyboard=True, one_time_keyboard=True,
+)
+
+timezone_keyboard = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("Алматы (UTC+6)"), KeyboardButton("Москва (UTC+3)")],
+        [KeyboardButton("Киев (UTC+2)"), KeyboardButton("Ташкент (UTC+5)")],
+        [KeyboardButton("Бишкек (UTC+6)"), KeyboardButton("Дубай (UTC+4)")],
+        [KeyboardButton("Стамбул (UTC+3)"), KeyboardButton("Берлин (UTC+1)")],
+        [KeyboardButton("Лондон (UTC+0)"), KeyboardButton("Нью-Йорк (UTC-5)")],
         [KeyboardButton("Назад")],
     ],
     resize_keyboard=True, one_time_keyboard=True,
@@ -239,6 +264,64 @@ async def set_last_category_id(user_id, category_id: int):
             ''', (user_id, category_id))
     except aiosqlite.Error as e:
         logging.error(f"Ошибка set_last_category_id: {e}")
+
+
+async def get_user_timezone(user_id) -> pytz.BaseTzInfo:
+    """Возвращает объект часового пояса пользователя."""
+    try:
+        async with DatabaseConnection() as cursor:
+            await cursor.execute(
+                'SELECT timezone FROM user_settings WHERE user_id = ?', (user_id,))
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return pytz.timezone(row[0])
+    except (aiosqlite.Error, pytz.UnknownTimeZoneError):
+        pass
+    return DEFAULT_TZ
+
+
+async def get_user_timezone_name(user_id) -> str:
+    """Возвращает строку часового пояса пользователя."""
+    try:
+        async with DatabaseConnection() as cursor:
+            await cursor.execute(
+                'SELECT timezone FROM user_settings WHERE user_id = ?', (user_id,))
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+    except aiosqlite.Error:
+        pass
+    return 'Asia/Almaty'
+
+
+async def set_user_timezone(user_id, tz_name: str):
+    try:
+        pytz.timezone(tz_name)  # проверяем валидность
+        async with DatabaseConnection() as cursor:
+            await cursor.execute('''
+                INSERT INTO user_settings (user_id, timezone) VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET timezone = excluded.timezone
+            ''', (user_id, tz_name))
+        return True
+    except pytz.UnknownTimeZoneError:
+        return False
+    except aiosqlite.Error as e:
+        logging.error(f"Ошибка set_user_timezone: {e}")
+        return False
+
+
+async def ensure_timezone_column():
+    """Добавляет колонку timezone в user_settings, если её нет."""
+    try:
+        async with DatabaseConnection() as cursor:
+            await cursor.execute("PRAGMA table_info(user_settings)")
+            columns = [row[1] for row in await cursor.fetchall()]
+            if 'timezone' not in columns:
+                await cursor.execute(
+                    "ALTER TABLE user_settings ADD COLUMN timezone TEXT DEFAULT 'Asia/Almaty'")
+                logging.info("Колонка 'timezone' добавлена в user_settings.")
+    except aiosqlite.Error as e:
+        logging.error(f"Ошибка ensure_timezone_column: {e}")
 
 
 async def get_category_name_by_id(category_id) -> str | None:
@@ -679,17 +762,24 @@ async def delete_template(template_id, user_id):
 
 
 async def get_templates_for_today():
-    """Получает все шаблоны, у которых день совпадает с сегодняшним."""
-    today = datetime.now(ALMATY_TZ).day
+    """Получает все шаблоны, у которых день совпадает с сегодняшним (по часовому поясу пользователя)."""
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute('''
-                SELECT t.id, t.user_id, c.name, t.name, t.amount, t.category_id
+                SELECT t.id, t.user_id, c.name, t.name, t.amount, t.category_id, t.day_of_month
                 FROM recurring_templates t
                 JOIN categories c ON t.category_id = c.id
-                WHERE t.day_of_month = ?
-            ''', (today,))
-            return await cursor.fetchall()
+            ''')
+            all_templates = await cursor.fetchall()
+
+        result = []
+        for tpl_id, tpl_user_id, cat_name, tpl_name, amount, category_id, day_of_month in all_templates:
+            user_tz = await get_user_timezone(tpl_user_id)
+            now = datetime.now(user_tz)
+            if day_of_month == now.day and now.hour == 9:
+                result.append((tpl_id, tpl_user_id, cat_name,
+                              tpl_name, amount, category_id))
+        return result
     except aiosqlite.Error as e:
         logging.error(f"Ошибка get_templates_for_today: {e}")
         return []
@@ -874,28 +964,33 @@ async def get_period_dates(period: str) -> tuple[str, str]:
 async def send_monthly_comparisons():
     """Отправляет сравнение прошлого месяца с позапрошлым всем активным пользователям."""
     try:
-        now = datetime.now(ALMATY_TZ)
-        first_of_current = now.replace(
-            day=1, hour=0, minute=0, second=0, microsecond=0)
-
-        # Прошлый месяц
-        last_month_end = first_of_current - timedelta(seconds=1)
-        last_month_start = last_month_end.replace(
-            day=1, hour=0, minute=0, second=0, microsecond=0)
-
-        # Позапрошлый месяц
-        prev_month_end = last_month_start - timedelta(seconds=1)
-        prev_month_start = prev_month_end.replace(
-            day=1, hour=0, minute=0, second=0, microsecond=0)
-
-        fmt = "%Y-%m-%d %H:%M:%S"
-
         async with DatabaseConnection() as cursor:
             await cursor.execute('SELECT DISTINCT user_id FROM expenses')
             users = await cursor.fetchall()
 
         for (user_id,) in users:
             try:
+                user_tz = await get_user_timezone(user_id)
+                now = datetime.now(user_tz)
+
+                # Отправляем только если у пользователя сейчас 1-е число и 9:00
+                if now.day != 1 or now.hour != 9:
+                    continue
+
+                first_of_current = now.replace(
+                    day=1, hour=0, minute=0, second=0, microsecond=0)
+
+                # Прошлый месяц
+                last_month_end = first_of_current - timedelta(seconds=1)
+                last_month_start = last_month_end.replace(
+                    day=1, hour=0, minute=0, second=0, microsecond=0)
+
+                # Позапрошлый месяц
+                prev_month_end = last_month_start - timedelta(seconds=1)
+                prev_month_start = prev_month_end.replace(
+                    day=1, hour=0, minute=0, second=0, microsecond=0)
+
+                fmt = "%Y-%m-%d %H:%M:%S"
                 _, symbol = await get_user_currency(user_id)
 
                 last = await get_expenses(
@@ -1626,6 +1721,7 @@ async def handle_message(client, message):
             "Такси 500\n\n"
             "Команды:\n"
             "/currency KZT — установить валюту\n"
+            "/timezone Asia/Almaty — часовой пояс\n"
             "/help — справка",
             reply_markup=main_keyboard)
         await send_pinned_template_message(client, message)
@@ -1648,6 +1744,22 @@ async def handle_message(client, message):
             return
         await set_user_currency(user_id, code)
         await message.reply(f"Валюта установлена: {CURRENCY_SYMBOLS[code]} ({code})", reply_markup=main_keyboard)
+        return
+
+    if text.startswith("/timezone"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            tz_name = await get_user_timezone_name(user_id)
+            await message.reply(
+                f"Текущий часовой пояс: {tz_name}\n\n"
+                f"Использование: /timezone Asia/Almaty")
+            return
+        tz_input = parts[1].strip()
+        success = await set_user_timezone(user_id, tz_input)
+        if success:
+            await message.reply(f"Часовой пояс установлен: {tz_input}", reply_markup=main_keyboard)
+        else:
+            await message.reply(f"Неизвестный часовой пояс: {tz_input}")
         return
 
     if text == "/help":
@@ -1740,6 +1852,16 @@ async def handle_message(client, message):
             f"Доступные: {codes}\n\n"
             f"Использование: /currency KZT",
             reply_markup=service_submenu)
+        return
+
+    if text == "Часовой пояс":
+        tz_name = await get_user_timezone_name(user_id)
+        await message.reply(
+            f"Текущий часовой пояс: {tz_name}\n\n"
+            "Выберите из списка или введите вручную\n"
+            "(например: Europe/Moscow, Asia/Almaty):",
+            reply_markup=timezone_keyboard)
+        await set_user_state(user_id, "set_timezone")
         return
 
     if text == "Справка":
@@ -2029,6 +2151,33 @@ async def handle_message(client, message):
         await reset_user_state(user_id)
         return
 
+    # ── Установка часового пояса ──
+    if state == "set_timezone":
+        if text == "Назад":
+            await message.reply("Сервис:", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        # Проверяем, выбрал ли пользователь из кнопок
+        tz_name = POPULAR_TIMEZONES.get(text)
+        if tz_name is None:
+            # Пробуем как прямой ввод (например: Europe/Moscow)
+            tz_name = text.strip()
+
+        success = await set_user_timezone(user_id, tz_name)
+        if success:
+            await message.reply(
+                f"✅ Часовой пояс установлен: {tz_name}",
+                reply_markup=main_keyboard)
+        else:
+            await message.reply(
+                f"Неизвестный часовой пояс: «{text}».\n"
+                "Выберите из списка или введите в формате: Region/City",
+                reply_markup=timezone_keyboard)
+            return
+        await reset_user_state(user_id)
+        return
+
     # ── Редактирование трат: шаг 1 — выбор периода ──
     if state == "edit_choose_period":
         if text == "Назад":
@@ -2294,20 +2443,20 @@ async def handle_message(client, message):
 
 # ─── Планировщик ─────────────────────────────────────────────────────────────
 
-scheduler = AsyncIOScheduler(timezone=ALMATY_TZ)
+scheduler = AsyncIOScheduler(timezone=pytz.UTC)
 
-# Ежемесячное сравнение — 1-го числа в 9:00
-scheduler.add_job(send_monthly_comparisons, 'cron', day=1, hour=9, minute=0,
+# Проверяем каждый час — функции сами определяют, нужно ли отправлять по часовому поясу пользователя
+scheduler.add_job(send_monthly_comparisons, 'cron', hour='*', minute=0,
                   id='monthly_comparison', replace_existing=True)
 
-# Напоминания по шаблонам — каждый день в 9:00
-scheduler.add_job(send_template_reminders, 'cron', hour=9, minute=0,
+scheduler.add_job(send_template_reminders, 'cron', hour='*', minute=0,
                   id='template_reminders', replace_existing=True)
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def main():
+    await ensure_timezone_column()
     async with app:
         scheduler.start()
         logging.info("Бот запущен. Планировщик активен.")
