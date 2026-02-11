@@ -105,7 +105,8 @@ report_submenu = ReplyKeyboardMarkup(
 service_submenu = ReplyKeyboardMarkup(
     [
         [KeyboardButton("Валюта"), KeyboardButton("Справка")],
-        [KeyboardButton("Редактировать траты")],
+        [KeyboardButton("Редактировать траты"),
+         KeyboardButton("Удалить траты")],
         [KeyboardButton("Назад")],
     ],
     resize_keyboard=True, one_time_keyboard=True,
@@ -1750,6 +1751,11 @@ async def handle_message(client, message):
         await set_user_state(user_id, "edit_choose_period")
         return
 
+    if text == "Удалить траты":
+        await message.reply("Выберите период:", reply_markup=edit_period_keyboard)
+        await set_user_state(user_id, "del_choose_period")
+        return
+
     # ── Шаблоны ──
 
     if text == "Шаблоны":
@@ -2173,6 +2179,112 @@ async def handle_message(client, message):
                 reply_markup=main_keyboard)
         else:
             await message.reply("Не удалось обновить запись.", reply_markup=main_keyboard)
+        await reset_user_state(user_id)
+        return
+
+    # ── Удаление трат: шаг 1 — выбор периода ──
+    if state == "del_choose_period":
+        if text == "Назад":
+            await message.reply("Сервис:", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        periods = {"День": 0, "Неделя": 7, "Месяц": 30}
+        days = periods.get(text)
+        if days is None:
+            await message.reply("Выберите период:", reply_markup=edit_period_keyboard)
+            return
+
+        today = datetime.now()
+        start = today.strftime("%Y-%m-%d 00:00:00") if days == 0 \
+            else (today - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
+        end = today.strftime("%Y-%m-%d %H:%M:%S")
+
+        expenses = await get_expenses_for_period(start, end, user_id)
+        if not expenses:
+            await message.reply("Нет трат за этот период.", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        _, symbol = await get_user_currency(user_id)
+        lines = []
+        id_map = {}
+        for idx, (exp_id, cat_name, exp_name, total, date) in enumerate(expenses, 1):
+            date_short = date[:10] if date else "---"
+            label = f"{cat_name} — {exp_name}" if exp_name else cat_name
+            lines.append(
+                f"{idx}. {date_short} | {label} | {total:.2f} {symbol}")
+            id_map[str(idx)] = exp_id
+
+        report = "\n".join(lines)
+        back_kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("Назад")]],
+            resize_keyboard=True, one_time_keyboard=True)
+
+        await send_long_message(
+            message,
+            f"{report}\n\nВведите номер записи для удаления:",
+            reply_markup=back_kb)
+        await set_user_state(user_id, "del_choose_expense", {"id_map": id_map})
+        return
+
+    # ── Удаление трат: шаг 2 — выбор записи ──
+    if state == "del_choose_expense":
+        if text == "Назад":
+            await message.reply("Сервис:", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        id_map = data.get("id_map", {})
+        if text not in id_map:
+            await message.reply("Неверный номер. Введите номер из списка.")
+            return
+
+        expense_id = id_map[text]
+        _, symbol = await get_user_currency(user_id)
+
+        try:
+            async with DatabaseConnection() as cursor:
+                await cursor.execute('''
+                    SELECT c.name, e.name, e.total, e.date
+                    FROM expenses e JOIN categories c ON e.category_id = c.id
+                    WHERE e.id = ? AND e.user_id = ?
+                ''', (expense_id, user_id))
+                row = await cursor.fetchone()
+        except aiosqlite.Error:
+            row = None
+
+        if not row:
+            await message.reply("Запись не найдена.", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        cat_name, exp_name, total, date = row
+        date_short = date[:10] if date else "---"
+        label = f"{cat_name} — {exp_name}" if exp_name else cat_name
+        details = f"{date_short} | {label} | {total:.2f} {symbol}"
+
+        confirm_kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("Да"), KeyboardButton("Нет")]],
+            resize_keyboard=True, one_time_keyboard=True)
+
+        await message.reply(
+            f"Удалить запись?\n{details}",
+            reply_markup=confirm_kb)
+        await set_user_state(user_id, "del_confirm", {"expense_id": expense_id})
+        return
+
+    # ── Удаление трат: шаг 3 — подтверждение ──
+    if state == "del_confirm":
+        expense_id = data.get("expense_id")
+        if text == "Да":
+            success = await delete_expense_by_id(expense_id, user_id)
+            if success:
+                await message.reply("✅ Запись удалена.", reply_markup=main_keyboard)
+            else:
+                await message.reply("Не удалось удалить запись.", reply_markup=main_keyboard)
+        else:
+            await message.reply("Удаление отменено.", reply_markup=main_keyboard)
         await reset_user_state(user_id)
         return
 
