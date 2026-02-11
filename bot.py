@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 
 import aiosqlite
+import numpy as np
 import pandas as pd
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -882,6 +883,114 @@ async def create_pie_chart(data, user_id, currency_symbol='₸'):
     return chart_file
 
 
+def _group_key(date_str, group_by):
+    """Возвращает ключ группировки для даты."""
+    dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+    if group_by == 'day':
+        return dt.strftime("%d.%m")
+    elif group_by == 'week':
+        # Начало недели (понедельник)
+        monday = dt - timedelta(days=dt.weekday())
+        return monday.strftime("%d.%m")
+    elif group_by == 'month':
+        return dt.strftime("%m.%Y")
+    return dt.strftime("%d.%m")
+
+
+def _determine_grouping(start_date, end_date):
+    """Определяет группировку и доступные уровни детализации."""
+    start = datetime.strptime(start_date[:10], "%Y-%m-%d")
+    end = datetime.strptime(end_date[:10], "%Y-%m-%d")
+    days = (end - start).days + 1
+
+    if days <= 1:
+        return None, []  # только pie chart
+    elif days <= 93:
+        return 'day', []
+    elif days <= 365:
+        return 'week', ['day']
+    else:
+        return 'month', ['week', 'day']
+
+
+# Цветовая палитра для категорий (до 12 цветов, затем повтор)
+BAR_COLORS = [
+    '#4ECDC4', '#FF6B6B', '#45B7D1', '#FFA07A', '#98D8C8',
+    '#F7DC6F', '#BB8FCE', '#85C1E9', '#F0B27A', '#82E0AA',
+    '#F1948A', '#AED6F1',
+]
+
+
+async def create_stacked_bar_chart(rows, user_id, currency_symbol='₸', group_by='day'):
+    """Создаёт stacked bar chart с линией тренда.
+
+    rows: список (date, cat_name, exp_name, total) из get_expenses_by_period_detailed
+    """
+    if not rows:
+        return None
+
+    # Агрегируем: {group_key: {category: total}}
+    groups = OrderedDict()
+    all_categories = OrderedDict()
+
+    for date, cat_name, exp_name, total in rows:
+        key = _group_key(date, group_by)
+        if key not in groups:
+            groups[key] = {}
+        groups[key][cat_name] = groups[key].get(cat_name, 0) + total
+        all_categories[cat_name] = True
+
+    labels = list(groups.keys())
+    cat_names = list(all_categories.keys())
+
+    if not labels:
+        return None
+
+    # Матрица данных: [categories x groups]
+    data_matrix = []
+    for cat in cat_names:
+        data_matrix.append([groups[lbl].get(cat, 0) for lbl in labels])
+
+    x = np.arange(len(labels))
+    width = 0.6
+
+    fig, ax1 = plt.subplots(figsize=(max(10, len(labels) * 0.8), 6))
+
+    # Стекированные столбики
+    bottom = np.zeros(len(labels))
+    bars_list = []
+    for i, (cat, cat_data) in enumerate(zip(cat_names, data_matrix)):
+        color = BAR_COLORS[i % len(BAR_COLORS)]
+        bars = ax1.bar(x, cat_data, width, bottom=bottom,
+                       label=cat, color=color)
+        bars_list.append(bars)
+        bottom += np.array(cat_data)
+
+    # Линия тренда (общая сумма)
+    totals = bottom  # уже содержит суммы
+    ax1.plot(x, totals, color='#2C3E50', linewidth=2,
+             marker='o', markersize=4, zorder=5)
+
+    # Настройки осей
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, rotation=45 if len(
+        labels) > 10 else 0, ha='right' if len(labels) > 10 else 'center', fontsize=9)
+    ax1.set_ylabel(currency_symbol)
+
+    group_labels = {'day': 'по дням',
+                    'week': 'по неделям', 'month': 'по месяцам'}
+    ax1.set_title(f'Динамика расходов ({group_labels.get(group_by, "")})')
+
+    # Легенда
+    ax1.legend(loc='upper left', fontsize=8, ncol=min(len(cat_names), 4))
+
+    plt.tight_layout()
+    chart_file = f'expenses_bar_chart_{user_id}.png'
+    plt.savefig(chart_file, dpi=150)
+    plt.close()
+    return chart_file
+
+
 async def generate_excel_report(start_date, end_date, user_id) -> str | None:
     try:
         safe_start = start_date.replace(':', '-')
@@ -1218,7 +1327,10 @@ async def _send_category_report(message, start_date, end_date, user_id, category
     # Также готовим данные для графика и Excel (агрегированные)
     expenses_agg = await get_expenses_by_category(start_date, end_date, category, user_id)
 
-    chart_file = excel_file = None
+    # Определяем группировку
+    default_group, drill_options = _determine_grouping(start_date, end_date)
+
+    chart_file = bar_file = excel_file = None
     try:
         await send_long_message(message, report, reply_markup=main_keyboard)
         if expenses_agg:
@@ -1227,8 +1339,15 @@ async def _send_category_report(message, start_date, end_date, user_id, category
             if excel_file:
                 await message.reply_document(excel_file, reply_markup=main_keyboard)
             await message.reply_photo(chart_file, reply_markup=main_keyboard)
+
+            # Stacked bar (наименования как «категории» стека)
+            if default_group:
+                bar_rows = [(d, name, None, total) for name, total, d in rows]
+                bar_file = await create_stacked_bar_chart(bar_rows, user_id, symbol, default_group)
+                if bar_file:
+                    await message.reply_photo(bar_file, reply_markup=main_keyboard)
     finally:
-        safe_remove(chart_file, excel_file)
+        safe_remove(chart_file, bar_file, excel_file)
 
 
 async def _send_period_report(message, start_date, end_date, user_id, symbol):
@@ -1274,19 +1393,40 @@ async def _send_period_report(message, start_date, end_date, user_id, symbol):
 
     report += f"<b>Общая сумма: {grand_total:.2f} {symbol}</b>"
 
+    # Определяем группировку для графика
+    default_group, drill_options = _determine_grouping(start_date, end_date)
+
     # Графики и Excel
     expenses_agg = await get_expenses(start_date, end_date, user_id)
-    chart_file = excel_file = None
+    chart_file = bar_file = excel_file = None
     try:
         await send_long_message(message, report, reply_markup=main_keyboard)
+
         if expenses_agg:
+            # Pie chart
             chart_file = await create_pie_chart(expenses_agg, user_id, symbol)
             excel_file = await generate_excel_report(start_date, end_date, user_id)
             if excel_file:
                 await message.reply_document(excel_file, reply_markup=main_keyboard)
             await message.reply_photo(chart_file, reply_markup=main_keyboard)
+
+            # Stacked bar chart (только для периодов > 1 дня)
+            if default_group:
+                bar_file = await create_stacked_bar_chart(rows, user_id, symbol, default_group)
+                if bar_file:
+                    # Формируем inline-кнопки для детализации
+                    s = start_date[:10].replace('-', '')
+                    e = end_date[:10].replace('-', '')
+                    buttons = []
+                    for opt in drill_options:
+                        label = {'day': '📊 По дням',
+                                 'week': '📊 По неделям'}[opt]
+                        buttons.append(
+                            InlineKeyboardButton(label, callback_data=f"chart:{opt}:{s}:{e}"))
+                    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+                    await message.reply_photo(bar_file, reply_markup=kb or main_keyboard)
     finally:
-        safe_remove(chart_file, excel_file)
+        safe_remove(chart_file, bar_file, excel_file)
 
 
 # ─── Обработчик ввода трат (свободный + точный формат) ────────────────────────
@@ -1510,6 +1650,35 @@ async def handle_callback(client, callback_query: CallbackQuery):
         else:
             await callback_query.message.edit_text("Не удалось отменить (уже удалена).")
         await callback_query.answer()
+        return
+
+    # ── Детализация графика ──
+    if data.startswith("chart:"):
+        parts = data.split(":")
+        if len(parts) == 4:
+            group_by, s, e = parts[1], parts[2], parts[3]
+            start_date = f"{s[:4]}-{s[4:6]}-{s[6:8]} 00:00:00"
+            end_date = f"{e[:4]}-{e[4:6]}-{e[6:8]} 23:59:59"
+
+            await callback_query.answer("Строю график...")
+
+            _, symbol = await get_user_currency(user_id)
+            rows = await get_expenses_by_period_detailed(start_date, end_date, user_id)
+
+            if rows:
+                bar_file = await create_stacked_bar_chart(rows, user_id, symbol, group_by)
+                if bar_file:
+                    # Кнопки для дальнейшей детализации
+                    buttons = []
+                    if group_by == 'week':
+                        buttons.append(
+                            InlineKeyboardButton("📊 По дням", callback_data=f"chart:day:{s}:{e}"))
+                    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+
+                    await callback_query.message.reply_photo(bar_file, reply_markup=kb)
+                    safe_remove(bar_file)
+            else:
+                await callback_query.message.reply("Нет данных за период.")
         return
 
     # ── Подтверждение последней категории ──
