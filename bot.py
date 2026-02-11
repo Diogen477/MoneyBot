@@ -1,7 +1,9 @@
+import asyncio
 import json
 import logging
 import os
 import re
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 
@@ -55,8 +57,7 @@ CURRENCY_SYMBOLS = {
 main_keyboard = ReplyKeyboardMarkup(
     [
         [KeyboardButton("Категории"), KeyboardButton("Шаблоны")],
-        [KeyboardButton("Отчет"), KeyboardButton("Отчет по категории")],
-        [KeyboardButton("Все траты")],
+        [KeyboardButton("Отчет")],
     ],
     resize_keyboard=True,
 )
@@ -86,6 +87,15 @@ period_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton("Месяц"), KeyboardButton(
             "Квартал"), KeyboardButton("Год")],
         [KeyboardButton("Ввести даты вручную")],
+        [KeyboardButton("Назад")],
+    ],
+    resize_keyboard=True, one_time_keyboard=True,
+)
+
+report_submenu = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("По категориям"), KeyboardButton("За период")],
+        [KeyboardButton("Все траты")],
         [KeyboardButton("Назад")],
     ],
     resize_keyboard=True, one_time_keyboard=True,
@@ -523,11 +533,46 @@ async def get_expenses_by_category(start_date, end_date, category_name, user_id)
         return []
 
 
+async def get_expenses_by_category_detailed(start_date, end_date, category_name, user_id):
+    """Возвращает детальные траты по категории: [(name, total_per_name, date, amount_per_date), ...]"""
+    try:
+        category_id = await get_category_id(category_name, user_id)
+        if category_id is None:
+            return None
+        async with DatabaseConnection() as cursor:
+            await cursor.execute('''
+                SELECT e.name, e.total, e.date
+                FROM expenses e
+                WHERE e.category_id = ? AND e.date BETWEEN ? AND ? AND e.user_id = ?
+                ORDER BY e.name, e.date
+            ''', (category_id, start_date, end_date, user_id))
+            return await cursor.fetchall()
+    except aiosqlite.Error as e:
+        logging.error(f"Ошибка get_expenses_by_category_detailed: {e}")
+        return []
+
+
+async def get_expenses_by_period_detailed(start_date, end_date, user_id):
+    """Возвращает детальные траты за период: [(date, category_name, expense_name, total), ...]"""
+    try:
+        async with DatabaseConnection() as cursor:
+            await cursor.execute('''
+                SELECT e.date, c.name as category, e.name, e.total
+                FROM expenses e JOIN categories c ON e.category_id = c.id
+                WHERE e.date BETWEEN ? AND ? AND e.user_id = ?
+                ORDER BY e.date, c.name, e.name
+            ''', (start_date, end_date, user_id))
+            return await cursor.fetchall()
+    except aiosqlite.Error as e:
+        logging.error(f"Ошибка get_expenses_by_period_detailed: {e}")
+        return []
+
+
 async def get_all_expenses(user_id):
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute('''
-                SELECT c.name, e.name, e.price, e.quantity, e.total, e.date
+                SELECT e.id, c.name, e.name, e.price, e.quantity, e.total, e.date
                 FROM expenses e JOIN categories c ON e.category_id = c.id
                 WHERE e.user_id = ? ORDER BY e.date DESC
             ''', (user_id,))
@@ -908,8 +953,8 @@ async def handle_delete_category(message, category_id):
 # ─── Обработчики: отчёты ─────────────────────────────────────────────────────
 
 async def handle_report(message):
-    await message.reply("Выберите период:", reply_markup=period_keyboard)
-    await set_user_state(message.from_user.id, "choose_period", {})
+    await message.reply("Выберите тип отчёта:", reply_markup=report_submenu)
+    await reset_user_state(message.from_user.id)
 
 
 async def handle_report_category(message):
@@ -978,33 +1023,114 @@ async def handle_manual_dates(message, text, data):
 
 
 async def _send_report(message, start_date, end_date, user_id, category=None):
+    """Отчёт за период (без категории) или по категории — с новым форматом."""
     _, symbol = await get_user_currency(user_id)
 
     if category:
-        expenses = await get_expenses_by_category(start_date, end_date, category, user_id)
-        if expenses is None:
-            await message.reply(f"Категория '{category}' не найдена.", reply_markup=main_keyboard)
-            return
+        await _send_category_report(message, start_date, end_date, user_id, category, symbol)
     else:
-        expenses = await get_expenses(start_date, end_date, user_id)
+        await _send_period_report(message, start_date, end_date, user_id, symbol)
 
-    if not expenses:
-        label = f" по категории '{category}'" if category else ""
-        await message.reply(f"Нет данных{label} за период.", reply_markup=main_keyboard)
+
+async def _send_category_report(message, start_date, end_date, user_id, category, symbol):
+    """Детальный отчёт по категории."""
+    rows = await get_expenses_by_category_detailed(start_date, end_date, category, user_id)
+    if rows is None:
+        await message.reply(f"Категория '{category}' не найдена.", reply_markup=main_keyboard)
+        return
+    if not rows:
+        await message.reply(f"Нет данных по категории '{category}' за период.", reply_markup=main_keyboard)
         return
 
-    report = await format_expense_report(expenses, symbol)
-    if category:
-        report = f"Траты по категории '{category}':\n{report}"
+    # Группируем: {name: [(date, amount), ...]}
+    items = OrderedDict()
+    for name, total, date in rows:
+        item_name = name or '---'
+        if item_name not in items:
+            items[item_name] = []
+        date_short = date[:10] if date else "---"
+        items[item_name].append((date_short, total))
+
+    report = f"<b>Траты по категории '{category}':</b>\n\n"
+    grand_total = 0
+
+    for item_name, entries in items.items():
+        item_total = sum(amount for _, amount in entries)
+        grand_total += item_total
+        report += f"{item_name}: {item_total:.2f} {symbol}\n"
+        for date_str, amount in entries:
+            report += f"    {date_str} - {amount:.2f} {symbol}\n"
+        report += "\n"
+
+    report += f"<b>Общая сумма: {grand_total:.2f} {symbol}</b>"
+
+    # Также готовим данные для графика и Excel (агрегированные)
+    expenses_agg = await get_expenses_by_category(start_date, end_date, category, user_id)
 
     chart_file = excel_file = None
     try:
-        chart_file = await create_pie_chart(expenses, user_id, symbol)
-        excel_file = await generate_excel_report(start_date, end_date, user_id)
         await send_long_message(message, report, reply_markup=main_keyboard)
-        if excel_file:
-            await message.reply_document(excel_file, reply_markup=main_keyboard)
-        await message.reply_photo(chart_file, reply_markup=main_keyboard)
+        if expenses_agg:
+            chart_file = await create_pie_chart(expenses_agg, user_id, symbol)
+            excel_file = await generate_excel_report(start_date, end_date, user_id)
+            if excel_file:
+                await message.reply_document(excel_file, reply_markup=main_keyboard)
+            await message.reply_photo(chart_file, reply_markup=main_keyboard)
+    finally:
+        safe_remove(chart_file, excel_file)
+
+
+async def _send_period_report(message, start_date, end_date, user_id, symbol):
+    """Детальный отчёт за период."""
+    rows = await get_expenses_by_period_detailed(start_date, end_date, user_id)
+    if not rows:
+        await message.reply("Нет данных за период.", reply_markup=main_keyboard)
+        return
+
+    # Форматируем даты для заголовка
+    start_display = datetime.strptime(
+        start_date[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+    end_display = datetime.strptime(
+        end_date[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+
+    # Группируем: {date: {category: [(name, amount), ...]}}
+    dates = OrderedDict()
+    grand_total = 0
+
+    for date, cat_name, exp_name, total in rows:
+        date_short = date[:10] if date else "---"
+        if date_short not in dates:
+            dates[date_short] = OrderedDict()
+        if cat_name not in dates[date_short]:
+            dates[date_short][cat_name] = []
+        dates[date_short][cat_name].append((exp_name or '---', total))
+        grand_total += total
+
+    report = f"<b>Траты с {start_display} по {end_display}</b>\n\n"
+
+    for date_str, categories in dates.items():
+        date_display = datetime.strptime(
+            date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+        report += f"{date_display}:\n"
+        for cat_name, items in categories.items():
+            report += f"    {cat_name}:\n"
+            for exp_name, amount in items:
+                report += f"        {exp_name}: {amount:.2f} {symbol}\n"
+        report += "\n"
+
+    report += f"<b>Общая сумма: {grand_total:.2f} {symbol}</b>"
+
+    # Графики и Excel
+    expenses_agg = await get_expenses(start_date, end_date, user_id)
+    chart_file = excel_file = None
+    try:
+        await send_long_message(message, report, reply_markup=main_keyboard)
+        if expenses_agg:
+            chart_file = await create_pie_chart(expenses_agg, user_id, symbol)
+            excel_file = await generate_excel_report(start_date, end_date, user_id)
+            if excel_file:
+                await message.reply_document(excel_file, reply_markup=main_keyboard)
+            await message.reply_photo(chart_file, reply_markup=main_keyboard)
     finally:
         safe_remove(chart_file, excel_file)
 
@@ -1207,10 +1333,10 @@ async def handle_all_expenses(message):
         await message.reply("Нет записей о тратах.", reply_markup=main_keyboard)
         return
 
-    report = ""
-    for category, name, price, quantity, total, date in expenses:
+    report = "<b>Все траты:</b>\n\n"
+    for idx, (exp_id, category, name, price, quantity, total, date) in enumerate(expenses, 1):
         date_short = date[:10] if date else "---"
-        report += f"{date_short} | {category} | {name or '---'} | {total:.2f} {symbol}\n"
+        report += f"{idx}. {date_short} | {category} | {name or '---'} | {total:.2f} {symbol}\n"
 
     await send_long_message(message, report, reply_markup=main_keyboard)
 
@@ -1482,8 +1608,7 @@ async def handle_message(client, message):
             "Кнопки:\n"
             "Категории — управление категориями\n"
             "Шаблоны — повторяющиеся траты\n"
-            "Отчет — отчёт за период\n"
-            "Все траты — полный список",
+            "Отчет — отчёты (по категориям, за период, все траты)",
             reply_markup=main_keyboard)
         return
 
@@ -1545,8 +1670,13 @@ async def handle_message(client, message):
         await handle_report(message)
         return
 
-    if text == "Отчет по категории":
+    if text == "По категориям":
         await handle_report_category(message)
+        return
+
+    if text == "За период":
+        await message.reply("Выберите период:", reply_markup=period_keyboard)
+        await set_user_state(user_id, "choose_period", {})
         return
 
     if text == "Все траты":
