@@ -105,6 +105,16 @@ report_submenu = ReplyKeyboardMarkup(
 service_submenu = ReplyKeyboardMarkup(
     [
         [KeyboardButton("Валюта"), KeyboardButton("Справка")],
+        [KeyboardButton("Редактировать траты")],
+        [KeyboardButton("Назад")],
+    ],
+    resize_keyboard=True, one_time_keyboard=True,
+)
+
+edit_period_keyboard = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("День"), KeyboardButton(
+            "Неделя"), KeyboardButton("Месяц")],
         [KeyboardButton("Назад")],
     ],
     resize_keyboard=True, one_time_keyboard=True,
@@ -589,6 +599,42 @@ async def get_all_expenses(user_id):
     except aiosqlite.Error as e:
         logging.error(f"Ошибка get_all_expenses: {e}")
         return []
+
+
+async def get_expenses_for_period(start_date, end_date, user_id):
+    """Возвращает список трат за период с ID для редактирования."""
+    try:
+        async with DatabaseConnection() as cursor:
+            await cursor.execute('''
+                SELECT e.id, c.name, e.name, e.total, e.date
+                FROM expenses e JOIN categories c ON e.category_id = c.id
+                WHERE e.user_id = ? AND e.date BETWEEN ? AND ?
+                ORDER BY e.date DESC
+            ''', (user_id, start_date, end_date))
+            return await cursor.fetchall()
+    except aiosqlite.Error as e:
+        logging.error(f"Ошибка get_expenses_for_period: {e}")
+        return []
+
+
+async def update_expense(expense_id, user_id, category_id, name, price, quantity, total) -> bool:
+    """Обновляет запись о трате."""
+    try:
+        async with DatabaseConnection() as cursor:
+            await cursor.execute(
+                'SELECT id FROM expenses WHERE id = ? AND user_id = ?',
+                (expense_id, user_id))
+            if not await cursor.fetchone():
+                return False
+            await cursor.execute('''
+                UPDATE expenses
+                SET category_id = ?, name = ?, price = ?, quantity = ?, total = ?
+                WHERE id = ? AND user_id = ?
+            ''', (category_id, name, price, quantity, total, expense_id, user_id))
+            return True
+    except aiosqlite.Error as e:
+        logging.error(f"Ошибка update_expense: {e}")
+        return False
 
 
 # ─── Шаблоны повторяющихся трат ──────────────────────────────────────────────
@@ -1699,6 +1745,11 @@ async def handle_message(client, message):
         await message.reply(HELP_TEXT, reply_markup=service_submenu)
         return
 
+    if text == "Редактировать траты":
+        await message.reply("Выберите период:", reply_markup=edit_period_keyboard)
+        await set_user_state(user_id, "edit_choose_period")
+        return
+
     # ── Шаблоны ──
 
     if text == "Шаблоны":
@@ -1969,6 +2020,159 @@ async def handle_message(client, message):
             await message.reply(
                 "Ошибка при объединении категорий.",
                 reply_markup=category_submenu)
+        await reset_user_state(user_id)
+        return
+
+    # ── Редактирование трат: шаг 1 — выбор периода ──
+    if state == "edit_choose_period":
+        if text == "Назад":
+            await message.reply("Сервис:", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        periods = {"День": 0, "Неделя": 7, "Месяц": 30}
+        days = periods.get(text)
+        if days is None:
+            await message.reply("Выберите период:", reply_markup=edit_period_keyboard)
+            return
+
+        today = datetime.now()
+        start = today.strftime("%Y-%m-%d 00:00:00") if days == 0 \
+            else (today - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
+        end = today.strftime("%Y-%m-%d %H:%M:%S")
+
+        expenses = await get_expenses_for_period(start, end, user_id)
+        if not expenses:
+            await message.reply("Нет трат за этот период.", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        _, symbol = await get_user_currency(user_id)
+        # Формируем нумерованный список и запоминаем маппинг номер→id
+        lines = []
+        id_map = {}
+        for idx, (exp_id, cat_name, exp_name, total, date) in enumerate(expenses, 1):
+            date_short = date[:10] if date else "---"
+            label = f"{cat_name} — {exp_name}" if exp_name else cat_name
+            lines.append(
+                f"{idx}. {date_short} | {label} | {total:.2f} {symbol}")
+            id_map[str(idx)] = exp_id
+
+        report = "\n".join(lines)
+        back_kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("Назад")]],
+            resize_keyboard=True, one_time_keyboard=True)
+
+        await send_long_message(
+            message,
+            f"{report}\n\nВведите номер записи для редактирования:",
+            reply_markup=back_kb)
+        await set_user_state(user_id, "edit_choose_expense", {"id_map": id_map})
+        return
+
+    # ── Редактирование трат: шаг 2 — выбор записи ──
+    if state == "edit_choose_expense":
+        if text == "Назад":
+            await message.reply("Сервис:", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        id_map = data.get("id_map", {})
+        if text not in id_map:
+            await message.reply("Неверный номер. Введите номер из списка.")
+            return
+
+        expense_id = id_map[text]
+        _, symbol = await get_user_currency(user_id)
+
+        # Получаем данные записи
+        try:
+            async with DatabaseConnection() as cursor:
+                await cursor.execute('''
+                    SELECT c.name, e.name, e.price, e.quantity, e.total, e.date
+                    FROM expenses e JOIN categories c ON e.category_id = c.id
+                    WHERE e.id = ? AND e.user_id = ?
+                ''', (expense_id, user_id))
+                row = await cursor.fetchone()
+        except aiosqlite.Error:
+            row = None
+
+        if not row:
+            await message.reply("Запись не найдена.", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        cat_name, exp_name, price, quantity, total, date = row
+        date_short = date[:10] if date else "---"
+        label = f"{cat_name} — {exp_name}" if exp_name else cat_name
+        details = f"{date_short} | {label} | {total:.2f} {symbol}"
+
+        back_kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("Назад")]],
+            resize_keyboard=True, one_time_keyboard=True)
+
+        await message.reply(
+            f"Редактируем запись:\n{details}\n\n"
+            "Введите новые данные:\n"
+            "Категория, Наименование, Сумма\n"
+            "или: Категория, Наименование, Цена, Количество\n"
+            "или: Категория, Сумма",
+            reply_markup=back_kb)
+        await set_user_state(user_id, "edit_enter_new", {"expense_id": expense_id})
+        return
+
+    # ── Редактирование трат: шаг 3 — ввод новых данных ──
+    if state == "edit_enter_new":
+        if text == "Назад":
+            await message.reply("Сервис:", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        expense_id = data.get("expense_id")
+        _, symbol = await get_user_currency(user_id)
+
+        parts = [p.strip() for p in text.split(',')]
+        category_input = name = None
+        price = quantity = total = None
+
+        try:
+            if len(parts) == 4:
+                category_input, name, price, quantity = parts
+                price, quantity = float(price), float(quantity)
+                total = price * quantity
+            elif len(parts) == 3:
+                category_input, name, total = parts
+                total = float(total)
+            elif len(parts) == 2:
+                category_input, total = parts
+                total = float(total)
+            else:
+                await message.reply(
+                    "Неверный формат. Используйте:\n"
+                    "Категория, Наименование, Сумма\n"
+                    "или: Категория, Наименование, Цена, Количество\n"
+                    "или: Категория, Сумма")
+                return
+        except ValueError:
+            await message.reply("Неверный формат числа.")
+            return
+
+        category_id = await get_category_id(category_input, user_id)
+        if category_id is None:
+            await message.reply(
+                f"Категория '{category_input}' не найдена. Проверьте название.",
+                reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        success = await update_expense(expense_id, user_id, category_id, name, price, quantity, total)
+        if success:
+            label = f"{category_input} — {name}" if name else category_input
+            await message.reply(
+                f"✅ Запись обновлена: {label}: {total:.2f} {symbol}",
+                reply_markup=main_keyboard)
+        else:
+            await message.reply("Не удалось обновить запись.", reply_markup=main_keyboard)
         await reset_user_state(user_id)
         return
 
