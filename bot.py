@@ -26,6 +26,7 @@ from pyrogram.types import (
 )
 
 from setup_db import DatabaseConnection
+from help_text import HELP_TEXT
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
 
@@ -1603,24 +1604,7 @@ async def handle_message(client, message):
         return
 
     if text == "/help":
-        await message.reply(
-            "📖 Как пользоваться:\n\n"
-            "Свободный формат:\n"
-            "  Продукты яблоки 100\n"
-            "  Такси 500\n"
-            "  Еда пицца 400р\n\n"
-            "Точный формат:\n"
-            "  Продукты, Яблоки, 100, 2\n"
-            "  Такси, 500\n\n"
-            "Если категория не указана — бот предложит последнюю использованную.\n\n"
-            "Команды:\n"
-            "/currency KZT — установить валюту (KZT, RUB, USD, EUR...)\n"
-            "/help — эта справка\n\n"
-            "Кнопки:\n"
-            "Категории — управление категориями\n"
-            "Шаблоны — повторяющиеся траты\n"
-            "Отчет — отчёты (по категориям, за период, все траты)",
-            reply_markup=main_keyboard)
+        await message.reply(HELP_TEXT, reply_markup=main_keyboard)
         return
 
     # ── Меню ──
@@ -1712,24 +1696,7 @@ async def handle_message(client, message):
         return
 
     if text == "Справка":
-        await message.reply(
-            "📖 Как пользоваться:\n\n"
-            "Свободный формат:\n"
-            "  Продукты яблоки 100\n"
-            "  Такси 500\n"
-            "  Еда пицца 400р\n\n"
-            "Точный формат:\n"
-            "  Продукты, Яблоки, 100, 2\n"
-            "  Такси, 500\n\n"
-            "Если категория не указана — бот предложит последнюю использованную.\n\n"
-            "Команды:\n"
-            "/currency KZT — установить валюту (KZT, RUB, USD, EUR...)\n"
-            "/help — эта справка\n\n"
-            "Кнопки:\n"
-            "Категории — управление категориями\n"
-            "Шаблоны — повторяющиеся траты\n"
-            "Отчет — отчёты (по категориям, за период, все траты)",
-            reply_markup=service_submenu)
+        await message.reply(HELP_TEXT, reply_markup=service_submenu)
         return
 
     # ── Шаблоны ──
