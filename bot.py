@@ -905,12 +905,12 @@ def _determine_grouping(start_date, end_date):
 
     if days <= 1:
         return None, []  # только pie chart
-    elif days <= 93:
-        return 'day', []
+    elif days <= 31:
+        return 'day', []  # неделя / месяц
     elif days <= 365:
-        return 'week', ['day']
+        return 'week', ['day']  # квартал
     else:
-        return 'month', ['week', 'day']
+        return 'month', ['week', 'day']  # год
 
 
 # Цветовая палитра для категорий (до 12 цветов, затем повтор)
