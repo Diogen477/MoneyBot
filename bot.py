@@ -57,7 +57,7 @@ CURRENCY_SYMBOLS = {
 main_keyboard = ReplyKeyboardMarkup(
     [
         [KeyboardButton("Категории"), KeyboardButton("Шаблоны")],
-        [KeyboardButton("Отчет")],
+        [KeyboardButton("Отчет"), KeyboardButton("Сервис")],
     ],
     resize_keyboard=True,
 )
@@ -96,6 +96,14 @@ report_submenu = ReplyKeyboardMarkup(
     [
         [KeyboardButton("По категориям"), KeyboardButton("За период")],
         [KeyboardButton("Все траты")],
+        [KeyboardButton("Назад")],
+    ],
+    resize_keyboard=True, one_time_keyboard=True,
+)
+
+service_submenu = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("Валюта"), KeyboardButton("Справка")],
         [KeyboardButton("Назад")],
     ],
     resize_keyboard=True, one_time_keyboard=True,
@@ -1112,10 +1120,13 @@ async def _send_period_report(message, start_date, end_date, user_id, symbol):
         date_display = datetime.strptime(
             date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
         report += f"{date_display}:\n"
-        for cat_name, items in categories.items():
+        cat_list = list(categories.items())
+        for i, (cat_name, items) in enumerate(cat_list):
             report += f"    {cat_name}:\n"
             for exp_name, amount in items:
                 report += f"        {exp_name}: {amount:.2f} {symbol}\n"
+            if i < len(cat_list) - 1:
+                report += "\n"
         report += "\n"
 
     report += f"<b>Общая сумма: {grand_total:.2f} {symbol}</b>"
@@ -1681,6 +1692,44 @@ async def handle_message(client, message):
 
     if text == "Все траты":
         await handle_all_expenses(message)
+        return
+
+    # ── Сервис ──
+
+    if text == "Сервис":
+        await message.reply("Сервис:", reply_markup=service_submenu)
+        await reset_user_state(user_id)
+        return
+
+    if text == "Валюта":
+        _, symbol = await get_user_currency(user_id)
+        codes = ', '.join(CURRENCY_SYMBOLS.keys())
+        await message.reply(
+            f"Текущая валюта: {symbol}\n"
+            f"Доступные: {codes}\n\n"
+            f"Использование: /currency KZT",
+            reply_markup=service_submenu)
+        return
+
+    if text == "Справка":
+        await message.reply(
+            "📖 Как пользоваться:\n\n"
+            "Свободный формат:\n"
+            "  Продукты яблоки 100\n"
+            "  Такси 500\n"
+            "  Еда пицца 400р\n\n"
+            "Точный формат:\n"
+            "  Продукты, Яблоки, 100, 2\n"
+            "  Такси, 500\n\n"
+            "Если категория не указана — бот предложит последнюю использованную.\n\n"
+            "Команды:\n"
+            "/currency KZT — установить валюту (KZT, RUB, USD, EUR...)\n"
+            "/help — эта справка\n\n"
+            "Кнопки:\n"
+            "Категории — управление категориями\n"
+            "Шаблоны — повторяющиеся траты\n"
+            "Отчет — отчёты (по категориям, за период, все траты)",
+            reply_markup=service_submenu)
         return
 
     # ── Шаблоны ──
