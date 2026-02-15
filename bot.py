@@ -1344,7 +1344,7 @@ async def _send_category_report(message, start_date, end_date, user_id, category
 
     chart_file = bar_file = excel_file = None
     try:
-        await send_long_message(message, report, parse_mode='HTML', reply_markup=main_keyboard)
+        await send_long_message(message, report, parse_mode='html', reply_markup=main_keyboard)
         if expenses_agg:
             chart_file = await create_pie_chart(expenses_agg, user_id, symbol)
             excel_file = await generate_excel_report(start_date, end_date, user_id)
@@ -1412,7 +1412,7 @@ async def _send_period_report(message, start_date, end_date, user_id, symbol):
     expenses_agg = await get_expenses(start_date, end_date, user_id)
     chart_file = bar_file = excel_file = None
     try:
-        await send_long_message(message, report, parse_mode='HTML', reply_markup=main_keyboard)
+        await send_long_message(message, report, parse_mode='html', reply_markup=main_keyboard)
 
         if expenses_agg:
             # Pie chart
@@ -2467,10 +2467,13 @@ async def handle_message(client, message):
         expense_id = data.get("expense_id")
         _, symbol = await get_user_currency(user_id)
 
-        # Поддержка разделителей: , или |
-        parts = [p.strip() for p in re.split(r'[,|]', text)]
         category_input = name = None
         price = quantity = total = None
+
+        # Проверяем наличие разделителей
+        if ',' in text or '|' in text:
+            # Точный формат с разделителями
+            parts = [p.strip() for p in re.split(r'[,|]', text)]
 
         try:
             if len(parts) == 4:
@@ -2493,6 +2496,83 @@ async def handle_message(client, message):
         except ValueError:
             await message.reply("Неверный формат числа.")
             return
+# ── Редактирование трат: шаг 3 — ввод новых данных ──
+    if state == "edit_enter_new":
+        if text == "Назад":
+            await message.reply("Сервис:", reply_markup=service_submenu)
+            await reset_user_state(user_id)
+            return
+
+        expense_id = data.get("expense_id")
+        _, symbol = await get_user_currency(user_id)
+
+        category_input = name = None
+        price = quantity = total = None
+
+        # Проверяем наличие разделителей
+        if ',' in text or '|' in text:
+            # Точный формат с разделителями
+            parts = [p.strip() for p in re.split(r'[,|]', text)]
+
+            try:
+                if len(parts) == 4:
+                    category_input, name, price, quantity = parts
+                    price, quantity = float(price), float(quantity)
+                    total = price * quantity
+                elif len(parts) == 3:
+                    category_input, name, total = parts
+                    total = float(total)
+                elif len(parts) == 2:
+                    category_input, total = parts
+                    total = float(total)
+                else:
+                    await message.reply(
+                        "Неверный формат. Используйте:\n"
+                        "Категория, Наименование, Сумма\n"
+                        "или: Категория, Наименование, Цена, Количество\n"
+                        "или: Категория, Сумма")
+                    return
+            except ValueError:
+                await message.reply("Неверный формат числа.")
+                return
+        else:
+            # Свободный формат через пробелы
+            tokens = text.split()
+            if not tokens:
+                await message.reply("Пустой ввод.")
+                return
+
+            # Собираем числа и слова
+            numbers = []
+            words = []
+            for token in tokens:
+                try:
+                    numbers.append(float(token))
+                except ValueError:
+                    words.append(token)
+
+            if not numbers:
+                await message.reply("Не найдено чисел. Введите сумму.")
+                return
+
+            if not words:
+                await message.reply("Не найдено категории. Введите категорию.")
+                return
+
+            # Первое слово - категория
+            category_input = words[0]
+
+            # Остальные слова - название (если есть)
+            if len(words) > 1:
+                name = ' '.join(words[1:])
+
+            # Числа
+            if len(numbers) == 1:
+                total = numbers[0]
+            elif len(numbers) >= 2:
+                price = numbers[0]
+                quantity = numbers[1]
+                total = price * quantity
 
         category_id = await get_category_id(category_input, user_id)
         if category_id is None:
@@ -2512,7 +2592,6 @@ async def handle_message(client, message):
             await message.reply("Не удалось обновить запись.", reply_markup=main_keyboard)
         await reset_user_state(user_id)
         return
-
     # ── Удаление трат: шаг 1 — выбор периода ──
     if state == "del_choose_period":
         if text == "Назад":
