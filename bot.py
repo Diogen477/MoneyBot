@@ -177,12 +177,13 @@ def create_category_keyboard():
     ])
 
 
-def fuzzy_category_keyboard():
+def fuzzy_category_keyboard(proposed_name: str = None):
     """Клавиатура для нечёткого совпадения категории."""
+    create_button_text = f"➕ Создать «{proposed_name}»" if proposed_name else "➕ Нет, создать новую"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, использовать",
                               callback_data="fuzzy_cat_yes")],
-        [InlineKeyboardButton("➕ Нет, создать новую",
+        [InlineKeyboardButton(create_button_text,
                               callback_data="fuzzy_cat_new")],
         [InlineKeyboardButton("◀️ Назад", callback_data="fuzzy_cat_back")],
     ])
@@ -203,6 +204,17 @@ def template_confirm_keyboard(template_id):
 
 
 # ─── Утилиты ─────────────────────────────────────────────────────────────────
+
+def html_escape(text: str) -> str:
+    """Экранирует HTML символы для безопасного вывода."""
+    if not text:
+        return text
+    return (text.replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;')
+                .replace('"', '&quot;')
+                .replace("'", '&#x27;'))
+
 
 async def send_long_message(message, text, **kwargs):
     if len(text) <= MAX_MESSAGE_LENGTH:
@@ -1311,13 +1323,13 @@ async def _send_category_report(message, start_date, end_date, user_id, category
         date_short = date[:10] if date else "---"
         items[item_name].append((date_short, total))
 
-    report = f"<b>Траты по категории '{category}':</b>\n\n"
+    report = f"<b>Траты по категории '{html_escape(category)}':</b>\n\n"
     grand_total = 0
 
     for item_name, entries in items.items():
         item_total = sum(amount for _, amount in entries)
         grand_total += item_total
-        report += f"{item_name}: {item_total:.2f} {symbol}\n"
+        report += f"{html_escape(item_name)}: {item_total:.2f} {symbol}\n"
         for date_str, amount in entries:
             report += f"    {date_str} - {amount:.2f} {symbol}\n"
         report += "\n"
@@ -1332,7 +1344,7 @@ async def _send_category_report(message, start_date, end_date, user_id, category
 
     chart_file = bar_file = excel_file = None
     try:
-        await send_long_message(message, report, reply_markup=main_keyboard)
+        await send_long_message(message, report, parse_mode='HTML', reply_markup=main_keyboard)
         if expenses_agg:
             chart_file = await create_pie_chart(expenses_agg, user_id, symbol)
             excel_file = await generate_excel_report(start_date, end_date, user_id)
@@ -1384,9 +1396,9 @@ async def _send_period_report(message, start_date, end_date, user_id, symbol):
         report += f"{date_display}:\n"
         cat_list = list(categories.items())
         for i, (cat_name, items) in enumerate(cat_list):
-            report += f"    {cat_name}:\n"
+            report += f"    {html_escape(cat_name)}:\n"
             for exp_name, amount in items:
-                report += f"        {exp_name}: {amount:.2f} {symbol}\n"
+                report += f"        {html_escape(exp_name)}: {amount:.2f} {symbol}\n"
             if i < len(cat_list) - 1:
                 report += "\n"
         report += "\n"
@@ -1400,7 +1412,7 @@ async def _send_period_report(message, start_date, end_date, user_id, symbol):
     expenses_agg = await get_expenses(start_date, end_date, user_id)
     chart_file = bar_file = excel_file = None
     try:
-        await send_long_message(message, report, reply_markup=main_keyboard)
+        await send_long_message(message, report, parse_mode='HTML', reply_markup=main_keyboard)
 
         if expenses_agg:
             # Pie chart
@@ -1440,7 +1452,7 @@ async def _propose_fuzzy_category(message, fuzzy_cat_name: str, expense_data: di
     input_name = expense_data.get('proposed_input', '')
     prefix = f"Категория «{input_name}» не найдена, но есть «{fuzzy_cat_name}».\n" \
         if input_name else f"Найдена похожая категория «{fuzzy_cat_name}».\n"
-    await message.reply(prefix + "Использовать её?", reply_markup=fuzzy_category_keyboard())
+    await message.reply(prefix + "Использовать её?", reply_markup=fuzzy_category_keyboard(input_name))
 
 
 async def _propose_create_category(message, proposed_name: str, expense_data: dict, user_id: int):
@@ -1458,9 +1470,9 @@ async def handle_expense_entry(message, text):
     user_id = message.from_user.id
     _, symbol = await get_user_currency(user_id)
 
-    # --- Точный формат с запятыми ---
-    if ',' in text:
-        parts = [p.strip() for p in text.split(',')]
+    # --- Точный формат с запятыми или прочел (|) ---
+    if ',' in text or '|' in text:
+        parts = [p.strip() for p in re.split(r'[,|]', text)]
 
         if len(parts) == 4:
             try:
@@ -2455,7 +2467,8 @@ async def handle_message(client, message):
         expense_id = data.get("expense_id")
         _, symbol = await get_user_currency(user_id)
 
-        parts = [p.strip() for p in text.split(',')]
+        # Поддержка разделителей: , или |
+        parts = [p.strip() for p in re.split(r'[,|]', text)]
         category_input = name = None
         price = quantity = total = None
 
