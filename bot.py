@@ -26,7 +26,7 @@ from pyrogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from setup_db import DatabaseConnection
+from setup_db import DatabaseConnection, init_db
 from help_text import HELP_TEXT
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
@@ -156,6 +156,8 @@ async def category_keyboard(user_id):
 
 
 def undo_keyboard(expense_id):
+    if expense_id is None:
+        return main_keyboard
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "↩ Отменить", callback_data=f"undo:{expense_id}")]
@@ -189,13 +191,6 @@ def fuzzy_category_keyboard(proposed_name: str = None):
     ])
 
 
-def back_inline_keyboard(callback_data="back_to_menu"):
-    """Кнопка «Назад» в виде inline-кнопки."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ Назад", callback_data=callback_data)]
-    ])
-
-
 def template_confirm_keyboard(template_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Записать", callback_data=f"tpl_yes:{template_id}"),
@@ -219,8 +214,18 @@ def html_escape(text: str) -> str:
 async def send_long_message(message, text, **kwargs):
     if len(text) <= MAX_MESSAGE_LENGTH:
         return await message.reply(text, **kwargs)
-    for i in range(0, len(text), MAX_MESSAGE_LENGTH):
-        await message.reply(text[i:i + MAX_MESSAGE_LENGTH], **kwargs)
+    # Разбиваем по строкам, чтобы не разрезать HTML-теги
+    lines = text.split('\n')
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > MAX_MESSAGE_LENGTH:
+            if chunk:
+                await message.reply(chunk, **kwargs)
+            chunk = line
+        else:
+            chunk = chunk + '\n' + line if chunk else line
+    if chunk:
+        await message.reply(chunk, **kwargs)
 
 
 def safe_remove(*paths):
@@ -588,12 +593,13 @@ async def merge_categories_db(source_ids: list[int], new_name: str, user_id: int
 async def log_expense(user_id, category_id, name, price, quantity, total) -> int | None:
     """Записывает расход и возвращает его ID (для отмены)."""
     try:
+        user_tz = await get_user_timezone(user_id)
         async with DatabaseConnection() as cursor:
             await cursor.execute('''
                 INSERT INTO expenses (user_id, category_id, name, price, quantity, total, date)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (user_id, category_id, name, price, quantity, total,
-                  datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                  datetime.now(user_tz).strftime("%Y-%m-%d %H:%M:%S")))
             return cursor.lastrowid
     except aiosqlite.Error as e:
         logging.error(f"Ошибка log_expense: {e}")
@@ -867,16 +873,6 @@ async def parse_free_form(text: str, user_id: int) -> dict | None:
 
 # ─── Отчёты ──────────────────────────────────────────────────────────────────
 
-async def format_expense_report(data, currency_symbol='₸'):
-    report = ""
-    total_expense = 0
-    for category, total in data:
-        report += f"{category}: {total:.2f} {currency_symbol}\n"
-        total_expense += total
-    report += f"\nОбщая сумма: {total_expense:.2f} {currency_symbol}"
-    return report
-
-
 async def create_pie_chart(data, user_id, currency_symbol='₸'):
     categories = [item[0] for item in data]
     totals = [item[1] for item in data]
@@ -1028,6 +1024,9 @@ async def generate_excel_report(start_date, end_date, user_id) -> str | None:
         with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
             workbook = writer.book
             worksheet = workbook.create_sheet('Expenses Report')
+            # Удаляем дефолтный пустой лист
+            if 'Sheet' in workbook.sheetnames:
+                del workbook['Sheet']
             start_row, start_col, col_offset = 1, 1, 7
 
             for category, group in df.groupby('category'):
@@ -1068,8 +1067,12 @@ async def generate_excel_report(start_date, end_date, user_id) -> str | None:
         return None
 
 
-async def get_period_dates(period: str) -> tuple[str, str]:
-    today = datetime.now()
+async def get_period_dates(period: str, user_id: int = None) -> tuple[str, str]:
+    if user_id:
+        user_tz = await get_user_timezone(user_id)
+        today = datetime.now(user_tz)
+    else:
+        today = datetime.now(DEFAULT_TZ)
     periods = {"День": 0, "Неделя": 7, "Месяц": 30, "Квартал": 90, "Год": 365}
     days = periods.get(period)
     if days is not None:
@@ -1271,7 +1274,7 @@ async def handle_period_report(message, period, data):
         await message.reply("Неверный период.", reply_markup=period_keyboard)
         return
 
-    start_date, end_date = await get_period_dates(period)
+    start_date, end_date = await get_period_dates(period, user_id)
     category = data.get("category") if data else None
     await _send_report(message, start_date, end_date, user_id, category)
     await reset_user_state(user_id)
@@ -1544,6 +1547,9 @@ async def handle_expense_entry(message, text):
     if parsed['category']:
         # Категория найдена — записываем сразу
         category_id = await get_category_id(parsed['category'], user_id)
+        if category_id is None:
+            await message.reply("Ошибка: категория не найдена.", reply_markup=main_keyboard)
+            return
         expense_id = await log_expense(
             user_id, category_id, parsed['name'],
             parsed['price'], parsed['quantity'], parsed['total'])
@@ -1642,9 +1648,9 @@ async def handle_all_expenses(message):
     report = "<b>Все траты:</b>\n\n"
     for idx, (exp_id, category, name, price, quantity, total, date) in enumerate(expenses, 1):
         date_short = date[:10] if date else "---"
-        report += f"{idx}. {date_short} | {category} | {name or '---'} | {total:.2f} {symbol}\n"
+        report += f"{idx}. {date_short} | {html_escape(category)} | {html_escape(name) if name else '---'} | {total:.2f} {symbol}\n"
 
-    await send_long_message(message, report, reply_markup=main_keyboard)
+    await send_long_message(message, report, parse_mode=enums.ParseMode.HTML, reply_markup=main_keyboard)
 
 
 # ─── Callback-обработчик (inline-кнопки) ─────────────────────────────────────
@@ -2372,7 +2378,8 @@ async def handle_message(client, message):
             await message.reply("Выберите период:", reply_markup=edit_period_keyboard)
             return
 
-        today = datetime.now()
+        user_tz = await get_user_timezone(user_id)
+        today = datetime.now(user_tz)
         start = today.strftime("%Y-%m-%d 00:00:00") if days == 0 \
             else (today - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
         end = today.strftime("%Y-%m-%d %H:%M:%S")
@@ -2567,7 +2574,8 @@ async def handle_message(client, message):
             await message.reply("Выберите период:", reply_markup=edit_period_keyboard)
             return
 
-        today = datetime.now()
+        user_tz = await get_user_timezone(user_id)
+        today = datetime.now(user_tz)
         start = today.strftime("%Y-%m-%d 00:00:00") if days == 0 \
             else (today - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
         end = today.strftime("%Y-%m-%d %H:%M:%S")
@@ -2679,6 +2687,7 @@ scheduler.add_job(send_template_reminders, 'cron', hour='*', minute=0,
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def main():
+    await init_db()
     await ensure_timezone_column()
     async with app:
         scheduler.start()

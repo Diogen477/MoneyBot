@@ -6,20 +6,23 @@ import logging
 class DatabaseConnection:
     """Singleton-подключение к БД. Одно соединение на всё время работы бота."""
     _connection: aiosqlite.Connection | None = None
+    _lock: asyncio.Lock = asyncio.Lock()
 
     @classmethod
     async def get_connection(cls) -> aiosqlite.Connection:
-        if cls._connection is None:
-            cls._connection = await aiosqlite.connect('expenses.db')
-            await cls._connection.execute("PRAGMA journal_mode=WAL")
-            await cls._connection.execute("PRAGMA foreign_keys=ON")
+        async with cls._lock:
+            if cls._connection is None:
+                cls._connection = await aiosqlite.connect('expenses.db')
+                await cls._connection.execute("PRAGMA journal_mode=WAL")
+                await cls._connection.execute("PRAGMA foreign_keys=ON")
         return cls._connection
 
     @classmethod
     async def close(cls):
-        if cls._connection is not None:
-            await cls._connection.close()
-            cls._connection = None
+        async with cls._lock:
+            if cls._connection is not None:
+                await cls._connection.close()
+                cls._connection = None
 
     async def __aenter__(self):
         self.conn = await self.get_connection()
@@ -29,6 +32,11 @@ class DatabaseConnection:
     async def __aexit__(self, exc_type, exc_value, traceback):
         if exc_value is None:
             await self.conn.commit()
+        else:
+            try:
+                await self.conn.rollback()
+            except Exception:
+                pass
 
 
 async def init_db():
