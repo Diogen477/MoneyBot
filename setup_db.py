@@ -102,6 +102,36 @@ async def init_db():
         await cursor.execute(
             'CREATE INDEX IF NOT EXISTS idx_templates_user_day ON recurring_templates(user_id, day_of_month)')
 
+        # ── Миграция: объединение дублей категорий, отличающихся только регистром ──
+        await cursor.execute('''
+            SELECT c1.id AS dup_id, c2.id AS keep_id
+            FROM categories c1
+            JOIN categories c2
+              ON c1.user_id = c2.user_id
+             AND LOWER(c1.name) = LOWER(c2.name)
+             AND c1.id > c2.id
+        ''')
+        duplicates = await cursor.fetchall()
+        for dup_id, keep_id in duplicates:
+            await cursor.execute(
+                'UPDATE expenses SET category_id = ? WHERE category_id = ?',
+                (keep_id, dup_id))
+            await cursor.execute(
+                'UPDATE recurring_templates SET category_id = ? WHERE category_id = ?',
+                (keep_id, dup_id))
+            await cursor.execute(
+                'DELETE FROM categories WHERE id = ?', (dup_id,))
+        if duplicates:
+            logging.info(f"Миграция: объединено {len(duplicates)} дублей категорий (регистр)")
+
+        # Пересоздаём уникальный индекс с COLLATE NOCASE (если ещё нет)
+        try:
+            await cursor.execute(
+                'CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_user_name_nocase '
+                'ON categories(user_id, name COLLATE NOCASE)')
+        except Exception:
+            pass  # Индекс может конфликтовать со старым UNIQUE — не критично
+
 
 async def _standalone_init():
     await init_db()

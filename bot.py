@@ -507,8 +507,15 @@ async def find_fuzzy_from_words(words: list[str], user_id: int) -> tuple[str | N
 async def add_category(category_name, user_id):
     try:
         async with DatabaseConnection() as cursor:
+            # Проверяем, нет ли уже категории с таким именем (без учёта регистра)
             await cursor.execute(
-                'INSERT OR IGNORE INTO categories (name, user_id) VALUES (?, ?)',
+                'SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND user_id = ?',
+                (category_name, user_id))
+            existing = await cursor.fetchone()
+            if existing:
+                return  # Категория уже есть
+            await cursor.execute(
+                'INSERT INTO categories (name, user_id) VALUES (?, ?)',
                 (category_name, user_id))
     except aiosqlite.Error as e:
         logging.error(f"Ошибка add_category: {e}")
