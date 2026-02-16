@@ -132,6 +132,15 @@ async def init_db():
         except Exception:
             pass  # Индекс может конфликтовать со старым UNIQUE — не критично
 
+        # ── Миграция: нормализация названий трат (первая буква заглавная) ──
+        await cursor.execute('''
+            UPDATE expenses
+            SET name = UPPER(SUBSTR(name, 1, 1)) || SUBSTR(name, 2)
+            WHERE name IS NOT NULL
+              AND name != ''
+              AND SUBSTR(name, 1, 1) != UPPER(SUBSTR(name, 1, 1))
+        ''')
+
 
 async def _standalone_init():
     await init_db()
