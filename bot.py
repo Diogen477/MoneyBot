@@ -407,7 +407,8 @@ async def get_categories(user_id):
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute(
-                'SELECT id, name FROM categories WHERE user_id = ?', (user_id,))
+                'SELECT MIN(id), name FROM categories WHERE user_id = ? GROUP BY LOWER(name)',
+                (user_id,))
             return [f"{r[0]}: {r[1]}" for r in await cursor.fetchall()]
     except aiosqlite.Error as e:
         logging.error(f"Ошибка get_categories: {e}")
@@ -418,7 +419,8 @@ async def get_category_names(user_id):
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute(
-                'SELECT name FROM categories WHERE user_id = ?', (user_id,))
+                'SELECT name FROM categories WHERE user_id = ? GROUP BY LOWER(name)',
+                (user_id,))
             return [r[0] for r in await cursor.fetchall()]
     except aiosqlite.Error as e:
         logging.error(f"Ошибка get_category_names: {e}")
@@ -636,7 +638,7 @@ async def get_expenses(start_date, end_date, user_id):
                 SELECT c.name, SUM(e.total) as total
                 FROM expenses e JOIN categories c ON e.category_id = c.id
                 WHERE e.date BETWEEN ? AND ? AND e.user_id = ?
-                GROUP BY e.category_id
+                GROUP BY LOWER(c.name)
             ''', (start_date, end_date, user_id))
             return await cursor.fetchall()
     except aiosqlite.Error as e:
