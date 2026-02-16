@@ -889,17 +889,46 @@ async def parse_free_form(text: str, user_id: int) -> dict | None:
 async def create_pie_chart(data, user_id, currency_symbol='₸'):
     categories = [item[0] for item in data]
     totals = [item[1] for item in data]
+    grand_total = sum(totals)
 
-    def func(pct, allvals):
-        absolute = int(pct / 100. * sum(allvals))
-        return f"{pct:.1f}%\n({absolute} {currency_symbol})"
+    fig, ax = plt.subplots(figsize=(10, 8))
 
-    plt.figure(figsize=(10, 6))
-    plt.pie(totals, labels=categories, autopct=lambda pct: func(
-        pct, totals), startangle=140)
-    plt.title('Расходы по категориям')
+    wedges, _ = ax.pie(
+        totals,
+        startangle=140,
+        wedgeprops=dict(width=1.0, edgecolor='white', linewidth=1.5),
+    )
+
+    # Выносные линии с подписями
+    for i, (wedge, cat, total) in enumerate(zip(wedges, categories, totals)):
+        pct = total / grand_total * 100
+        ang = (wedge.theta2 + wedge.theta1) / 2
+        rad = np.deg2rad(ang)
+
+        # Точка на краю сегмента
+        x_edge = np.cos(rad)
+        y_edge = np.sin(rad)
+
+        # Точка для текста — дальше от центра
+        x_text = 1.35 * np.cos(rad)
+        y_text = 1.35 * np.sin(rad)
+
+        ha = 'left' if x_text >= 0 else 'right'
+
+        # Линия-сноска
+        ax.annotate(
+            f"{cat}\n{total:,.0f} {currency_symbol} ({pct:.1f}%)",
+            xy=(x_edge, y_edge),
+            xytext=(x_text, y_text),
+            fontsize=8,
+            ha=ha, va='center',
+            arrowprops=dict(arrowstyle='-', color='gray', lw=0.8),
+        )
+
+    ax.set_title('Расходы по категориям', fontsize=13, pad=20)
+
     chart_file = f'expenses_pie_chart_{user_id}.png'
-    plt.savefig(chart_file)
+    plt.savefig(chart_file, dpi=150, bbox_inches='tight')
     plt.close()
     return chart_file
 
