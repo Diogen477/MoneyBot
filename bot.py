@@ -1604,27 +1604,7 @@ async def handle_expense_entry(message, text):
             await _propose_fuzzy_category(message, fuzzy_cat, expense_data, user_id)
             return
 
-        # Нечёткого совпадения нет — предлагаем последнюю категорию или создать
-        last_cat_id = await get_last_category_id(user_id)
-        if last_cat_id:
-            last_cat_name = await get_category_name_by_id(last_cat_id)
-            if last_cat_name:
-                await set_user_state(user_id, "pending_expense", {
-                    "name": parsed['name'],
-                    "price": parsed['price'],
-                    "quantity": parsed['quantity'],
-                    "total": parsed['total'],
-                    "category_id": last_cat_id,
-                    "category_name": last_cat_name,
-                })
-                label = f"{parsed['name']} {parsed['total']:.2f}" if parsed['name'] \
-                    else f"{parsed['total']:.2f}"
-                await message.reply(
-                    f"Записать «{label} {symbol}» в категорию «{last_cat_name}»?",
-                    reply_markup=confirm_category_keyboard())
-                return
-
-        # Предлагаем создать категорию из первого слова
+        # Нечёткого совпадения нет — предлагаем создать категорию из первого слова
         proposed_name = words[0] if words else text.strip()
         expense_data = {
             'name': parsed.get('name'),
