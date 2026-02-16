@@ -606,7 +606,8 @@ async def log_expense(user_id, category_id, name, price, quantity, total) -> int
         user_tz = await get_user_timezone(user_id)
         # Нормализуем имя: первая буква заглавная
         if name and isinstance(name, str):
-            name = name[0].upper() + name[1:] if len(name) > 1 else name.upper()
+            name = name[0].upper() + \
+                name[1:] if len(name) > 1 else name.upper()
         async with DatabaseConnection() as cursor:
             await cursor.execute('''
                 INSERT INTO expenses (user_id, category_id, name, price, quantity, total, date)
@@ -924,8 +925,6 @@ async def create_pie_chart(data, user_id, currency_symbol='₸'):
             ha=ha, va='center',
             arrowprops=dict(arrowstyle='-', color='gray', lw=0.8),
         )
-
-    ax.set_title('Расходы по категориям', fontsize=13, pad=20)
 
     chart_file = f'expenses_pie_chart_{user_id}.png'
     plt.savefig(chart_file, dpi=150, bbox_inches='tight')
