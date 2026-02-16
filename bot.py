@@ -603,6 +603,9 @@ async def log_expense(user_id, category_id, name, price, quantity, total) -> int
     """Записывает расход и возвращает его ID (для отмены)."""
     try:
         user_tz = await get_user_timezone(user_id)
+        # Нормализуем имя: первая буква заглавная
+        if name and isinstance(name, str):
+            name = name[0].upper() + name[1:] if len(name) > 1 else name.upper()
         async with DatabaseConnection() as cursor:
             await cursor.execute('''
                 INSERT INTO expenses (user_id, category_id, name, price, quantity, total, date)
@@ -656,7 +659,7 @@ async def get_expenses_by_category(start_date, end_date, category_name, user_id)
                 SELECT e.name, SUM(e.total) as total
                 FROM expenses e
                 WHERE e.category_id = ? AND e.date BETWEEN ? AND ? AND e.user_id = ?
-                GROUP BY e.name
+                GROUP BY LOWER(e.name)
             ''', (category_id, start_date, end_date, user_id))
             return await cursor.fetchall()
     except aiosqlite.Error as e:
@@ -1326,14 +1329,19 @@ async def _send_category_report(message, start_date, end_date, user_id, category
         await message.reply(f"Нет данных по категории '{category}' за период.", reply_markup=main_keyboard)
         return
 
-    # Группируем: {name: [(date, amount), ...]}
+    # Группируем: {name: [(date, amount), ...]} (без учёта регистра)
     items = OrderedDict()
+    name_display = {}  # LOWER(name) → первое встреченное написание
     for name, total, date in rows:
         item_name = name or '---'
-        if item_name not in items:
-            items[item_name] = []
+        key = item_name.lower()
+        if key not in name_display:
+            name_display[key] = item_name
+        display = name_display[key]
+        if display not in items:
+            items[display] = []
         date_short = date[:10] if date else "---"
-        items[item_name].append((date_short, total))
+        items[display].append((date_short, total))
 
     report = f"<b>Траты по категории '{html_escape(category)}':</b>\n\n"
     grand_total = 0
@@ -1391,13 +1399,19 @@ async def _send_period_report(message, start_date, end_date, user_id, symbol):
     dates = OrderedDict()
     grand_total = 0
 
+    cat_display = {}  # LOWER(name) → первое встреченное написание
     for date, cat_name, exp_name, total in rows:
         date_short = date[:10] if date else "---"
         if date_short not in dates:
             dates[date_short] = OrderedDict()
-        if cat_name not in dates[date_short]:
-            dates[date_short][cat_name] = []
-        dates[date_short][cat_name].append((exp_name or '---', total))
+        # Объединяем категории с разным регистром
+        cat_key = cat_name.lower()
+        if cat_key not in cat_display:
+            cat_display[cat_key] = cat_name
+        display_cat = cat_display[cat_key]
+        if display_cat not in dates[date_short]:
+            dates[date_short][display_cat] = []
+        dates[date_short][display_cat].append((exp_name or '---', total))
         grand_total += total
 
     report = f"<b>Траты с {start_display} по {end_display}</b>\n\n"
