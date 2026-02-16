@@ -175,7 +175,8 @@ def create_category_keyboard():
     """Клавиатура для предложения создать новую категорию."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, создать", callback_data="create_cat_yes"),
-         InlineKeyboardButton("❌ Нет", callback_data="create_cat_no")]
+         InlineKeyboardButton("❌ Нет", callback_data="create_cat_no")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="create_cat_back")],
     ])
 
 
@@ -1827,6 +1828,13 @@ async def handle_callback(client, callback_query: CallbackQuery):
             "Выберите существующую категорию или создайте новую через меню «Категории»."
         )
         await app.send_message(user_id, "Выберите категорию:", reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    if data == "create_cat_back":
+        await reset_user_state(user_id)
+        await callback_query.message.edit_text("Отменено.")
+        await app.send_message(user_id, "Главное меню.", reply_markup=main_keyboard)
         await callback_query.answer()
         return
 
