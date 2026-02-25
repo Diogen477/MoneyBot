@@ -8,13 +8,14 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 
 import aiosqlite
+import numpy as np
 import pandas as pd
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from matplotlib import pyplot as plt
 from openpyxl.styles import Font
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, enums
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
     CallbackQuery,
@@ -25,7 +26,7 @@ from pyrogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from setup_db import DatabaseConnection
+from setup_db import DatabaseConnection, init_db
 from help_text import HELP_TEXT
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
@@ -155,6 +156,8 @@ async def category_keyboard(user_id):
 
 
 def undo_keyboard(expense_id):
+    if expense_id is None:
+        return main_keyboard
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "↩ Отменить", callback_data=f"undo:{expense_id}")]
@@ -172,25 +175,20 @@ def create_category_keyboard():
     """Клавиатура для предложения создать новую категорию."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, создать", callback_data="create_cat_yes"),
-         InlineKeyboardButton("❌ Нет", callback_data="create_cat_no")]
+         InlineKeyboardButton("❌ Нет", callback_data="create_cat_no")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="create_cat_back")],
     ])
 
 
-def fuzzy_category_keyboard():
+def fuzzy_category_keyboard(proposed_name: str = None):
     """Клавиатура для нечёткого совпадения категории."""
+    create_button_text = f"➕ Создать «{proposed_name}»" if proposed_name else "➕ Нет, создать новую"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, использовать",
                               callback_data="fuzzy_cat_yes")],
-        [InlineKeyboardButton("➕ Нет, создать новую",
+        [InlineKeyboardButton(create_button_text,
                               callback_data="fuzzy_cat_new")],
         [InlineKeyboardButton("◀️ Назад", callback_data="fuzzy_cat_back")],
-    ])
-
-
-def back_inline_keyboard(callback_data="back_to_menu"):
-    """Кнопка «Назад» в виде inline-кнопки."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ Назад", callback_data=callback_data)]
     ])
 
 
@@ -203,11 +201,32 @@ def template_confirm_keyboard(template_id):
 
 # ─── Утилиты ─────────────────────────────────────────────────────────────────
 
+def html_escape(text: str) -> str:
+    """Экранирует HTML символы для безопасного вывода."""
+    if not text:
+        return text
+    return (text.replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;')
+                .replace('"', '&quot;')
+                .replace("'", '&#x27;'))
+
+
 async def send_long_message(message, text, **kwargs):
     if len(text) <= MAX_MESSAGE_LENGTH:
         return await message.reply(text, **kwargs)
-    for i in range(0, len(text), MAX_MESSAGE_LENGTH):
-        await message.reply(text[i:i + MAX_MESSAGE_LENGTH], **kwargs)
+    # Разбиваем по строкам, чтобы не разрезать HTML-теги
+    lines = text.split('\n')
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > MAX_MESSAGE_LENGTH:
+            if chunk:
+                await message.reply(chunk, **kwargs)
+            chunk = line
+        else:
+            chunk = chunk + '\n' + line if chunk else line
+    if chunk:
+        await message.reply(chunk, **kwargs)
 
 
 def safe_remove(*paths):
@@ -389,7 +408,8 @@ async def get_categories(user_id):
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute(
-                'SELECT id, name FROM categories WHERE user_id = ?', (user_id,))
+                'SELECT MIN(id), name FROM categories WHERE user_id = ? GROUP BY LOWER(name)',
+                (user_id,))
             return [f"{r[0]}: {r[1]}" for r in await cursor.fetchall()]
     except aiosqlite.Error as e:
         logging.error(f"Ошибка get_categories: {e}")
@@ -400,7 +420,8 @@ async def get_category_names(user_id):
     try:
         async with DatabaseConnection() as cursor:
             await cursor.execute(
-                'SELECT name FROM categories WHERE user_id = ?', (user_id,))
+                'SELECT name FROM categories WHERE user_id = ? GROUP BY LOWER(name)',
+                (user_id,))
             return [r[0] for r in await cursor.fetchall()]
     except aiosqlite.Error as e:
         logging.error(f"Ошибка get_category_names: {e}")
@@ -489,8 +510,15 @@ async def find_fuzzy_from_words(words: list[str], user_id: int) -> tuple[str | N
 async def add_category(category_name, user_id):
     try:
         async with DatabaseConnection() as cursor:
+            # Проверяем, нет ли уже категории с таким именем (без учёта регистра)
             await cursor.execute(
-                'INSERT OR IGNORE INTO categories (name, user_id) VALUES (?, ?)',
+                'SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND user_id = ?',
+                (category_name, user_id))
+            existing = await cursor.fetchone()
+            if existing:
+                return  # Категория уже есть
+            await cursor.execute(
+                'INSERT INTO categories (name, user_id) VALUES (?, ?)',
                 (category_name, user_id))
     except aiosqlite.Error as e:
         logging.error(f"Ошибка add_category: {e}")
@@ -575,12 +603,17 @@ async def merge_categories_db(source_ids: list[int], new_name: str, user_id: int
 async def log_expense(user_id, category_id, name, price, quantity, total) -> int | None:
     """Записывает расход и возвращает его ID (для отмены)."""
     try:
+        user_tz = await get_user_timezone(user_id)
+        # Нормализуем имя: первая буква заглавная
+        if name and isinstance(name, str):
+            name = name[0].upper() + \
+                name[1:] if len(name) > 1 else name.upper()
         async with DatabaseConnection() as cursor:
             await cursor.execute('''
                 INSERT INTO expenses (user_id, category_id, name, price, quantity, total, date)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (user_id, category_id, name, price, quantity, total,
-                  datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                  datetime.now(user_tz).strftime("%Y-%m-%d %H:%M:%S")))
             return cursor.lastrowid
     except aiosqlite.Error as e:
         logging.error(f"Ошибка log_expense: {e}")
@@ -610,7 +643,7 @@ async def get_expenses(start_date, end_date, user_id):
                 SELECT c.name, SUM(e.total) as total
                 FROM expenses e JOIN categories c ON e.category_id = c.id
                 WHERE e.date BETWEEN ? AND ? AND e.user_id = ?
-                GROUP BY e.category_id
+                GROUP BY LOWER(c.name)
             ''', (start_date, end_date, user_id))
             return await cursor.fetchall()
     except aiosqlite.Error as e:
@@ -628,7 +661,7 @@ async def get_expenses_by_category(start_date, end_date, category_name, user_id)
                 SELECT e.name, SUM(e.total) as total
                 FROM expenses e
                 WHERE e.category_id = ? AND e.date BETWEEN ? AND ? AND e.user_id = ?
-                GROUP BY e.name
+                GROUP BY LOWER(e.name)
             ''', (category_id, start_date, end_date, user_id))
             return await cursor.fetchall()
     except aiosqlite.Error as e:
@@ -854,30 +887,155 @@ async def parse_free_form(text: str, user_id: int) -> dict | None:
 
 # ─── Отчёты ──────────────────────────────────────────────────────────────────
 
-async def format_expense_report(data, currency_symbol='₸'):
-    report = ""
-    total_expense = 0
-    for category, total in data:
-        report += f"{category}: {total:.2f} {currency_symbol}\n"
-        total_expense += total
-    report += f"\nОбщая сумма: {total_expense:.2f} {currency_symbol}"
-    return report
-
-
 async def create_pie_chart(data, user_id, currency_symbol='₸'):
     categories = [item[0] for item in data]
     totals = [item[1] for item in data]
+    grand_total = sum(totals)
 
-    def func(pct, allvals):
-        absolute = int(pct / 100. * sum(allvals))
-        return f"{pct:.1f}%\n({absolute} {currency_symbol})"
+    fig, ax = plt.subplots(figsize=(10, 8))
 
-    plt.figure(figsize=(10, 6))
-    plt.pie(totals, labels=categories, autopct=lambda pct: func(
-        pct, totals), startangle=140)
-    plt.title('Расходы по категориям')
+    wedges, _ = ax.pie(
+        totals,
+        startangle=140,
+        wedgeprops=dict(width=1.0, edgecolor='white', linewidth=1.5),
+    )
+
+    # Выносные линии с подписями
+    for i, (wedge, cat, total) in enumerate(zip(wedges, categories, totals)):
+        pct = total / grand_total * 100
+        ang = (wedge.theta2 + wedge.theta1) / 2
+        rad = np.deg2rad(ang)
+
+        # Точка на краю сегмента
+        x_edge = np.cos(rad)
+        y_edge = np.sin(rad)
+
+        # Точка для текста — дальше от центра
+        x_text = 1.35 * np.cos(rad)
+        y_text = 1.35 * np.sin(rad)
+
+        ha = 'left' if x_text >= 0 else 'right'
+
+        # Линия-сноска
+        ax.annotate(
+            f"{cat}\n{total:,.0f} {currency_symbol} ({pct:.1f}%)",
+            xy=(x_edge, y_edge),
+            xytext=(x_text, y_text),
+            fontsize=8,
+            ha=ha, va='center',
+            arrowprops=dict(arrowstyle='-', color='gray', lw=0.8),
+        )
+
     chart_file = f'expenses_pie_chart_{user_id}.png'
-    plt.savefig(chart_file)
+    plt.savefig(chart_file, dpi=150, bbox_inches='tight')
+    plt.close()
+    return chart_file
+
+
+def _group_key(date_str, group_by):
+    """Возвращает ключ группировки для даты."""
+    dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+    if group_by == 'day':
+        return dt.strftime("%d.%m")
+    elif group_by == 'week':
+        # Начало недели (понедельник)
+        monday = dt - timedelta(days=dt.weekday())
+        return monday.strftime("%d.%m")
+    elif group_by == 'month':
+        return dt.strftime("%m.%Y")
+    return dt.strftime("%d.%m")
+
+
+def _determine_grouping(start_date, end_date):
+    """Определяет группировку и доступные уровни детализации."""
+    start = datetime.strptime(start_date[:10], "%Y-%m-%d")
+    end = datetime.strptime(end_date[:10], "%Y-%m-%d")
+    days = (end - start).days + 1
+
+    if days <= 1:
+        return None, []  # только pie chart
+    elif days <= 31:
+        return 'day', []  # неделя / месяц
+    elif days <= 365:
+        return 'week', ['day']  # квартал
+    else:
+        return 'month', ['week', 'day']  # год
+
+
+# Цветовая палитра для категорий (до 12 цветов, затем повтор)
+BAR_COLORS = [
+    '#4ECDC4', '#FF6B6B', '#45B7D1', '#FFA07A', '#98D8C8',
+    '#F7DC6F', '#BB8FCE', '#85C1E9', '#F0B27A', '#82E0AA',
+    '#F1948A', '#AED6F1',
+]
+
+
+async def create_stacked_bar_chart(rows, user_id, currency_symbol='₸', group_by='day'):
+    """Создаёт stacked bar chart с линией тренда.
+
+    rows: список (date, cat_name, exp_name, total) из get_expenses_by_period_detailed
+    """
+    if not rows:
+        return None
+
+    # Агрегируем: {group_key: {category: total}}
+    groups = OrderedDict()
+    all_categories = OrderedDict()
+
+    for date, cat_name, exp_name, total in rows:
+        key = _group_key(date, group_by)
+        if key not in groups:
+            groups[key] = {}
+        groups[key][cat_name] = groups[key].get(cat_name, 0) + total
+        all_categories[cat_name] = True
+
+    labels = list(groups.keys())
+    cat_names = list(all_categories.keys())
+
+    if not labels:
+        return None
+
+    # Матрица данных: [categories x groups]
+    data_matrix = []
+    for cat in cat_names:
+        data_matrix.append([groups[lbl].get(cat, 0) for lbl in labels])
+
+    x = np.arange(len(labels))
+    width = 0.6
+
+    fig, ax1 = plt.subplots(figsize=(max(10, len(labels) * 0.8), 6))
+
+    # Стекированные столбики
+    bottom = np.zeros(len(labels))
+    bars_list = []
+    for i, (cat, cat_data) in enumerate(zip(cat_names, data_matrix)):
+        color = BAR_COLORS[i % len(BAR_COLORS)]
+        bars = ax1.bar(x, cat_data, width, bottom=bottom,
+                       label=cat, color=color)
+        bars_list.append(bars)
+        bottom += np.array(cat_data)
+
+    # Линия тренда (общая сумма)
+    totals = bottom  # уже содержит суммы
+    ax1.plot(x, totals, color='#2C3E50', linewidth=2,
+             marker='o', markersize=4, zorder=5)
+
+    # Настройки осей
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, rotation=45 if len(
+        labels) > 10 else 0, ha='right' if len(labels) > 10 else 'center', fontsize=9)
+    ax1.set_ylabel(currency_symbol)
+
+    group_labels = {'day': 'по дням',
+                    'week': 'по неделям', 'month': 'по месяцам'}
+    ax1.set_title(f'Динамика расходов ({group_labels.get(group_by, "")})')
+
+    # Легенда
+    ax1.legend(loc='upper left', fontsize=8, ncol=min(len(cat_names), 4))
+
+    plt.tight_layout()
+    chart_file = f'expenses_bar_chart_{user_id}.png'
+    plt.savefig(chart_file, dpi=150)
     plt.close()
     return chart_file
 
@@ -907,6 +1065,9 @@ async def generate_excel_report(start_date, end_date, user_id) -> str | None:
         with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
             workbook = writer.book
             worksheet = workbook.create_sheet('Expenses Report')
+            # Удаляем дефолтный пустой лист
+            if 'Sheet' in workbook.sheetnames:
+                del workbook['Sheet']
             start_row, start_col, col_offset = 1, 1, 7
 
             for category, group in df.groupby('category'):
@@ -947,8 +1108,12 @@ async def generate_excel_report(start_date, end_date, user_id) -> str | None:
         return None
 
 
-async def get_period_dates(period: str) -> tuple[str, str]:
-    today = datetime.now()
+async def get_period_dates(period: str, user_id: int = None) -> tuple[str, str]:
+    if user_id:
+        user_tz = await get_user_timezone(user_id)
+        today = datetime.now(user_tz)
+    else:
+        today = datetime.now(DEFAULT_TZ)
     periods = {"День": 0, "Неделя": 7, "Месяц": 30, "Квартал": 90, "Год": 365}
     days = periods.get(period)
     if days is not None:
@@ -1150,7 +1315,7 @@ async def handle_period_report(message, period, data):
         await message.reply("Неверный период.", reply_markup=period_keyboard)
         return
 
-    start_date, end_date = await get_period_dates(period)
+    start_date, end_date = await get_period_dates(period, user_id)
     category = data.get("category") if data else None
     await _send_report(message, start_date, end_date, user_id, category)
     await reset_user_state(user_id)
@@ -1193,22 +1358,27 @@ async def _send_category_report(message, start_date, end_date, user_id, category
         await message.reply(f"Нет данных по категории '{category}' за период.", reply_markup=main_keyboard)
         return
 
-    # Группируем: {name: [(date, amount), ...]}
+    # Группируем: {name: [(date, amount), ...]} (без учёта регистра)
     items = OrderedDict()
+    name_display = {}  # LOWER(name) → первое встреченное написание
     for name, total, date in rows:
         item_name = name or '---'
-        if item_name not in items:
-            items[item_name] = []
+        key = item_name.lower()
+        if key not in name_display:
+            name_display[key] = item_name
+        display = name_display[key]
+        if display not in items:
+            items[display] = []
         date_short = date[:10] if date else "---"
-        items[item_name].append((date_short, total))
+        items[display].append((date_short, total))
 
-    report = f"<b>Траты по категории '{category}':</b>\n\n"
+    report = f"<b>Траты по категории '{html_escape(category)}':</b>\n\n"
     grand_total = 0
 
     for item_name, entries in items.items():
         item_total = sum(amount for _, amount in entries)
         grand_total += item_total
-        report += f"{item_name}: {item_total:.2f} {symbol}\n"
+        report += f"{html_escape(item_name)}: {item_total:.2f} {symbol}\n"
         for date_str, amount in entries:
             report += f"    {date_str} - {amount:.2f} {symbol}\n"
         report += "\n"
@@ -1218,17 +1388,27 @@ async def _send_category_report(message, start_date, end_date, user_id, category
     # Также готовим данные для графика и Excel (агрегированные)
     expenses_agg = await get_expenses_by_category(start_date, end_date, category, user_id)
 
-    chart_file = excel_file = None
+    # Определяем группировку
+    default_group, drill_options = _determine_grouping(start_date, end_date)
+
+    chart_file = bar_file = excel_file = None
     try:
-        await send_long_message(message, report, reply_markup=main_keyboard)
+        await send_long_message(message, report, parse_mode=enums.ParseMode.HTML, reply_markup=main_keyboard)
         if expenses_agg:
             chart_file = await create_pie_chart(expenses_agg, user_id, symbol)
             excel_file = await generate_excel_report(start_date, end_date, user_id)
             if excel_file:
                 await message.reply_document(excel_file, reply_markup=main_keyboard)
             await message.reply_photo(chart_file, reply_markup=main_keyboard)
+
+            # Stacked bar (наименования как «категории» стека)
+            if default_group:
+                bar_rows = [(d, name, None, total) for name, total, d in rows]
+                bar_file = await create_stacked_bar_chart(bar_rows, user_id, symbol, default_group)
+                if bar_file:
+                    await message.reply_photo(bar_file, reply_markup=main_keyboard)
     finally:
-        safe_remove(chart_file, excel_file)
+        safe_remove(chart_file, bar_file, excel_file)
 
 
 async def _send_period_report(message, start_date, end_date, user_id, symbol):
@@ -1248,13 +1428,19 @@ async def _send_period_report(message, start_date, end_date, user_id, symbol):
     dates = OrderedDict()
     grand_total = 0
 
+    cat_display = {}  # LOWER(name) → первое встреченное написание
     for date, cat_name, exp_name, total in rows:
         date_short = date[:10] if date else "---"
         if date_short not in dates:
             dates[date_short] = OrderedDict()
-        if cat_name not in dates[date_short]:
-            dates[date_short][cat_name] = []
-        dates[date_short][cat_name].append((exp_name or '---', total))
+        # Объединяем категории с разным регистром
+        cat_key = cat_name.lower()
+        if cat_key not in cat_display:
+            cat_display[cat_key] = cat_name
+        display_cat = cat_display[cat_key]
+        if display_cat not in dates[date_short]:
+            dates[date_short][display_cat] = []
+        dates[date_short][display_cat].append((exp_name or '---', total))
         grand_total += total
 
     report = f"<b>Траты с {start_display} по {end_display}</b>\n\n"
@@ -1265,28 +1451,49 @@ async def _send_period_report(message, start_date, end_date, user_id, symbol):
         report += f"{date_display}:\n"
         cat_list = list(categories.items())
         for i, (cat_name, items) in enumerate(cat_list):
-            report += f"    {cat_name}:\n"
+            report += f"    {html_escape(cat_name)}:\n"
             for exp_name, amount in items:
-                report += f"        {exp_name}: {amount:.2f} {symbol}\n"
+                report += f"        {html_escape(exp_name)}: {amount:.2f} {symbol}\n"
             if i < len(cat_list) - 1:
                 report += "\n"
         report += "\n"
 
     report += f"<b>Общая сумма: {grand_total:.2f} {symbol}</b>"
 
+    # Определяем группировку для графика
+    default_group, drill_options = _determine_grouping(start_date, end_date)
+
     # Графики и Excel
     expenses_agg = await get_expenses(start_date, end_date, user_id)
-    chart_file = excel_file = None
+    chart_file = bar_file = excel_file = None
     try:
-        await send_long_message(message, report, reply_markup=main_keyboard)
+        await send_long_message(message, report, parse_mode=enums.ParseMode.HTML, reply_markup=main_keyboard)
+
         if expenses_agg:
+            # Pie chart
             chart_file = await create_pie_chart(expenses_agg, user_id, symbol)
             excel_file = await generate_excel_report(start_date, end_date, user_id)
             if excel_file:
                 await message.reply_document(excel_file, reply_markup=main_keyboard)
             await message.reply_photo(chart_file, reply_markup=main_keyboard)
+
+            # Stacked bar chart (только для периодов > 1 дня)
+            if default_group:
+                bar_file = await create_stacked_bar_chart(rows, user_id, symbol, default_group)
+                if bar_file:
+                    # Формируем inline-кнопки для детализации
+                    s = start_date[:10].replace('-', '')
+                    e = end_date[:10].replace('-', '')
+                    buttons = []
+                    for opt in drill_options:
+                        label = {'day': '📊 По дням',
+                                 'week': '📊 По неделям'}[opt]
+                        buttons.append(
+                            InlineKeyboardButton(label, callback_data=f"chart:{opt}:{s}:{e}"))
+                    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+                    await message.reply_photo(bar_file, reply_markup=kb or main_keyboard)
     finally:
-        safe_remove(chart_file, excel_file)
+        safe_remove(chart_file, bar_file, excel_file)
 
 
 # ─── Обработчик ввода трат (свободный + точный формат) ────────────────────────
@@ -1300,7 +1507,7 @@ async def _propose_fuzzy_category(message, fuzzy_cat_name: str, expense_data: di
     input_name = expense_data.get('proposed_input', '')
     prefix = f"Категория «{input_name}» не найдена, но есть «{fuzzy_cat_name}».\n" \
         if input_name else f"Найдена похожая категория «{fuzzy_cat_name}».\n"
-    await message.reply(prefix + "Использовать её?", reply_markup=fuzzy_category_keyboard())
+    await message.reply(prefix + "Использовать её?", reply_markup=fuzzy_category_keyboard(input_name))
 
 
 async def _propose_create_category(message, proposed_name: str, expense_data: dict, user_id: int):
@@ -1318,9 +1525,9 @@ async def handle_expense_entry(message, text):
     user_id = message.from_user.id
     _, symbol = await get_user_currency(user_id)
 
-    # --- Точный формат с запятыми ---
-    if ',' in text:
-        parts = [p.strip() for p in text.split(',')]
+    # --- Точный формат с запятыми или прочел (|) ---
+    if ',' in text or '|' in text:
+        parts = [p.strip() for p in re.split(r'[,|]', text)]
 
         if len(parts) == 4:
             try:
@@ -1392,6 +1599,9 @@ async def handle_expense_entry(message, text):
     if parsed['category']:
         # Категория найдена — записываем сразу
         category_id = await get_category_id(parsed['category'], user_id)
+        if category_id is None:
+            await message.reply("Ошибка: категория не найдена.", reply_markup=main_keyboard)
+            return
         expense_id = await log_expense(
             user_id, category_id, parsed['name'],
             parsed['price'], parsed['quantity'], parsed['total'])
@@ -1423,27 +1633,7 @@ async def handle_expense_entry(message, text):
             await _propose_fuzzy_category(message, fuzzy_cat, expense_data, user_id)
             return
 
-        # Нечёткого совпадения нет — предлагаем последнюю категорию или создать
-        last_cat_id = await get_last_category_id(user_id)
-        if last_cat_id:
-            last_cat_name = await get_category_name_by_id(last_cat_id)
-            if last_cat_name:
-                await set_user_state(user_id, "pending_expense", {
-                    "name": parsed['name'],
-                    "price": parsed['price'],
-                    "quantity": parsed['quantity'],
-                    "total": parsed['total'],
-                    "category_id": last_cat_id,
-                    "category_name": last_cat_name,
-                })
-                label = f"{parsed['name']} {parsed['total']:.2f}" if parsed['name'] \
-                    else f"{parsed['total']:.2f}"
-                await message.reply(
-                    f"Записать «{label} {symbol}» в категорию «{last_cat_name}»?",
-                    reply_markup=confirm_category_keyboard())
-                return
-
-        # Предлагаем создать категорию из первого слова
+        # Нечёткого совпадения нет — предлагаем создать категорию из первого слова
         proposed_name = words[0] if words else text.strip()
         expense_data = {
             'name': parsed.get('name'),
@@ -1490,9 +1680,9 @@ async def handle_all_expenses(message):
     report = "<b>Все траты:</b>\n\n"
     for idx, (exp_id, category, name, price, quantity, total, date) in enumerate(expenses, 1):
         date_short = date[:10] if date else "---"
-        report += f"{idx}. {date_short} | {category} | {name or '---'} | {total:.2f} {symbol}\n"
+        report += f"{idx}. {date_short} | {html_escape(category)} | {html_escape(name) if name else '---'} | {total:.2f} {symbol}\n"
 
-    await send_long_message(message, report, reply_markup=main_keyboard)
+    await send_long_message(message, report, parse_mode=enums.ParseMode.HTML, reply_markup=main_keyboard)
 
 
 # ─── Callback-обработчик (inline-кнопки) ─────────────────────────────────────
@@ -1510,6 +1700,35 @@ async def handle_callback(client, callback_query: CallbackQuery):
         else:
             await callback_query.message.edit_text("Не удалось отменить (уже удалена).")
         await callback_query.answer()
+        return
+
+    # ── Детализация графика ──
+    if data.startswith("chart:"):
+        parts = data.split(":")
+        if len(parts) == 4:
+            group_by, s, e = parts[1], parts[2], parts[3]
+            start_date = f"{s[:4]}-{s[4:6]}-{s[6:8]} 00:00:00"
+            end_date = f"{e[:4]}-{e[4:6]}-{e[6:8]} 23:59:59"
+
+            await callback_query.answer("Строю график...")
+
+            _, symbol = await get_user_currency(user_id)
+            rows = await get_expenses_by_period_detailed(start_date, end_date, user_id)
+
+            if rows:
+                bar_file = await create_stacked_bar_chart(rows, user_id, symbol, group_by)
+                if bar_file:
+                    # Кнопки для дальнейшей детализации
+                    buttons = []
+                    if group_by == 'week':
+                        buttons.append(
+                            InlineKeyboardButton("📊 По дням", callback_data=f"chart:day:{s}:{e}"))
+                    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+
+                    await callback_query.message.reply_photo(bar_file, reply_markup=kb)
+                    safe_remove(bar_file)
+            else:
+                await callback_query.message.reply("Нет данных за период.")
         return
 
     # ── Подтверждение последней категории ──
@@ -1637,6 +1856,13 @@ async def handle_callback(client, callback_query: CallbackQuery):
             "Выберите существующую категорию или создайте новую через меню «Категории»."
         )
         await app.send_message(user_id, "Выберите категорию:", reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    if data == "create_cat_back":
+        await reset_user_state(user_id)
+        await callback_query.message.edit_text("Отменено.")
+        await app.send_message(user_id, "Главное меню.", reply_markup=main_keyboard)
         await callback_query.answer()
         return
 
@@ -2191,7 +2417,8 @@ async def handle_message(client, message):
             await message.reply("Выберите период:", reply_markup=edit_period_keyboard)
             return
 
-        today = datetime.now()
+        user_tz = await get_user_timezone(user_id)
+        today = datetime.now(user_tz)
         start = today.strftime("%Y-%m-%d 00:00:00") if days == 0 \
             else (today - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
         end = today.strftime("%Y-%m-%d %H:%M:%S")
@@ -2286,31 +2513,73 @@ async def handle_message(client, message):
         expense_id = data.get("expense_id")
         _, symbol = await get_user_currency(user_id)
 
-        parts = [p.strip() for p in text.split(',')]
         category_input = name = None
         price = quantity = total = None
 
-        try:
-            if len(parts) == 4:
-                category_input, name, price, quantity = parts
-                price, quantity = float(price), float(quantity)
-                total = price * quantity
-            elif len(parts) == 3:
-                category_input, name, total = parts
-                total = float(total)
-            elif len(parts) == 2:
-                category_input, total = parts
-                total = float(total)
-            else:
-                await message.reply(
-                    "Неверный формат. Используйте:\n"
-                    "Категория, Наименование, Сумма\n"
-                    "или: Категория, Наименование, Цена, Количество\n"
-                    "или: Категория, Сумма")
+        # Проверяем наличие разделителей
+        if ',' in text or '|' in text:
+            # Точный формат с разделителями
+            parts = [p.strip() for p in re.split(r'[,|]', text)]
+
+            try:
+                if len(parts) == 4:
+                    category_input, name, price, quantity = parts
+                    price, quantity = float(price), float(quantity)
+                    total = price * quantity
+                elif len(parts) == 3:
+                    category_input, name, total = parts
+                    total = float(total)
+                elif len(parts) == 2:
+                    category_input, total = parts
+                    total = float(total)
+                else:
+                    await message.reply(
+                        "Неверный формат. Используйте:\n"
+                        "Категория, Наименование, Сумма\n"
+                        "или: Категория, Наименование, Цена, Количество\n"
+                        "или: Категория, Сумма")
+                    return
+            except ValueError:
+                await message.reply("Неверный формат числа.")
                 return
-        except ValueError:
-            await message.reply("Неверный формат числа.")
-            return
+        else:
+            # Свободный формат через пробелы
+            tokens = text.split()
+            if not tokens:
+                await message.reply("Пустой ввод.")
+                return
+
+            # Собираем числа и слова
+            numbers = []
+            words = []
+            for token in tokens:
+                try:
+                    numbers.append(float(token))
+                except ValueError:
+                    words.append(token)
+
+            if not numbers:
+                await message.reply("Не найдено чисел. Введите сумму.")
+                return
+
+            if not words:
+                await message.reply("Не найдено категории. Введите категорию.")
+                return
+
+            # Первое слово - категория
+            category_input = words[0]
+
+            # Остальные слова - название (если есть)
+            if len(words) > 1:
+                name = ' '.join(words[1:])
+
+            # Числа
+            if len(numbers) == 1:
+                total = numbers[0]
+            elif len(numbers) >= 2:
+                price = numbers[0]
+                quantity = numbers[1]
+                total = price * quantity
 
         category_id = await get_category_id(category_input, user_id)
         if category_id is None:
@@ -2344,7 +2613,8 @@ async def handle_message(client, message):
             await message.reply("Выберите период:", reply_markup=edit_period_keyboard)
             return
 
-        today = datetime.now()
+        user_tz = await get_user_timezone(user_id)
+        today = datetime.now(user_tz)
         start = today.strftime("%Y-%m-%d 00:00:00") if days == 0 \
             else (today - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
         end = today.strftime("%Y-%m-%d %H:%M:%S")
@@ -2456,6 +2726,7 @@ scheduler.add_job(send_template_reminders, 'cron', hour='*', minute=0,
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def main():
+    await init_db()
     await ensure_timezone_column()
     async with app:
         scheduler.start()
